@@ -1,0 +1,3 @@
+[submodule "external/ev2"]
+	path = external/ev2
+	url = git@github.com:ebajec/engine.git
