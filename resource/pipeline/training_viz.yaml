@@ -1,0 +1,5 @@
+shaders:
+  vert: cap://shader/point_3d.vert
+  frag: cap://shader/point_3d.frag
+input:
+  topology: TRIANGLE_STRIP
