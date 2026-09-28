@@ -31,6 +31,7 @@ struct COVQTrainingContext
 	uint32_t dim;
 	uint32_t N;
 
+	Eigen::MatrixXd P;
 	Eigen::MatrixXd Y;
 	Eigen::MatrixXd E;
 	Eigen::VectorXd v;
@@ -38,10 +39,12 @@ struct COVQTrainingContext
 	Eigen::MatrixXd S_wts;
 	Eigen::MatrixXd S_centers;
 
+	// one for each thread
 	Eigen::VectorXd d;
 
 	std::vector<uint32_t> mapping;
 };
+
 
 extern COVQTrainingContext *covq_init(
 	const Eigen::MatrixXd& X,
@@ -51,8 +54,6 @@ extern COVQTrainingContext *covq_init(
 extern void covq_training_it(
 	COVQTrainingContext &ctx,
 	const Eigen::MatrixXd &X,
-	const Eigen::MatrixXd &P, 
-	int its, 
 	COVQTrainingDump *dump = nullptr
 );
 

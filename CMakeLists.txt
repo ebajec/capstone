@@ -28,6 +28,7 @@ target_include_directories(${TARGET}
 target_compile_options(${TARGET}
 	PRIVATE
 	-O3
+	-g
 	-march=native
 )
 

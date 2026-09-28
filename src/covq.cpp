@@ -98,11 +98,14 @@ COVQTrainingContext *covq_init(
 	uint32_t dim = X.rows();
 	uint32_t N = P.rows();
 
+	uint32_t numthread = omp_get_num_threads();
+
 	*ctx = COVQTrainingContext{
 		.count = count,
 		.dim = dim,
 		.N = N,
 
+		.P = P,
 		.E = Eigen::MatrixXd::Zero(dim, N), 
 		.v = Eigen::VectorXd::Zero(N), 
 
@@ -111,8 +114,7 @@ COVQTrainingContext *covq_init(
 
 		.d = Eigen::VectorXd::Zero(N),
 
-		.mapping = std::vector<uint32_t>(count),
-
+		.mapping = std::vector<uint32_t>(count, 0),
 	};
 
 	ctx->Y = covq_init_centers(X, P);
@@ -125,39 +127,36 @@ COVQTrainingContext *covq_init(
 void covq_training_it(
 	COVQTrainingContext &ctx,
 	const Eigen::MatrixXd &X,
-	const Eigen::MatrixXd &P, 
-	int its, 
 	COVQTrainingDump *dump
 )
 {
+#undef EIGEN_USE_AVX512_GEMM_KERNELS
+#define EIGEN_USE_AVX512_GEMM_KERNELS 1
+
 	TIMER_BEGIN(TrainingIteration);
 
 	// compute E and v based on the codepoints from the previous iteration
 	
-	ctx.E.noalias() = ctx.Y * P.transpose();
-	ctx.v.noalias() = P * ctx.Y.colwise().squaredNorm().transpose();
-
-	// TODO: derive this from the data per element
-	const double p_x = 1.0 / X.cols(); 
-
-	uint32_t largest = 0;
+	ctx.E.noalias() = ctx.Y * ctx.P.transpose();
+	ctx.v.noalias() = ctx.P * ctx.Y.colwise().squaredNorm().transpose();
 
 	TIMER_BEGIN(Centroids);
-    //#pragma omp parallel for
-	for (uint32_t c = 0; c < ctx.count; ++c) {
-		uint32_t argmin = 0;
+	#pragma omp parallel
+	{
+		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(ctx.N);
 
-		ctx.d.noalias() = ctx.v - 2.0 * (ctx.E.transpose() * X.col(c));
-		ctx.d.minCoeff(&argmin);
+		#pragma omp for schedule(dynamic)
+		for (uint32_t c = 0; c < ctx.count; ++c) {
+			uint32_t argmin = 0;
 
-		uint32_t idx = argmin;
-		ctx.mapping[c] = argmin;
+			d_tls.noalias() = ctx.v - 2.0 * (ctx.E.transpose() * X.col(c));
+			d_tls.minCoeff(&argmin);
 
-		largest = std::max(largest, argmin);
+			uint32_t idx = argmin;
+			ctx.mapping[c] = argmin;
+		}
 	}
 	TIMER_END(Centroids);
-
-	printf("Largest: %d\n", largest);
 
 	// accumulate partition centroids
 	ctx.S_centers.setZero();
@@ -165,36 +164,40 @@ void covq_training_it(
 
 	for (uint32_t c = 0; c < ctx.count; ++c) {
 		uint32_t idx = ctx.mapping[c];
-		ctx.S_wts(0, idx) += p_x;
-		ctx.S_centers.col(idx).noalias() += p_x * X.col(c);
+		ctx.S_wts(0, idx) += 1.0;
+		ctx.S_centers.col(idx).noalias() += X.col(c);
 	}
 
-	ctx.Y.setZero();
-	ctx.Y.noalias() = ctx.S_centers * P;
+	const double p_x = 1.0 / X.cols(); 
 
-	double smallest = 0;
+	ctx.S_wts *= p_x;
+	ctx.S_centers *= p_x;
+
+	ctx.Y.setZero();
+	ctx.Y.noalias() = ctx.S_centers * ctx.P;
 
 	for (uint32_t j = 0; j < ctx.N; ++j) {
-		double den = (ctx.S_wts * P.col(j))(0,0);
+		double den = (ctx.S_wts * ctx.P.col(j))(0,0);
 
+		// TODO: Ignore partitions with zero elements
 		if (fabs(den) < 1e-6) {
 			ctx.Y.col(j).setZero();
 		} else {
 			ctx.Y.col(j) /= den;
 		}
-
-		smallest = std::min(den, smallest);
 	}
-	printf("smallest: %f\n", smallest);
 
 	TIMER_END(TrainingIteration);
 
 	if (dump) {
 		std::unique_lock<std::mutex> lock(dump->sync);
+		TIMER_BEGIN(TrainingDump);
 		dump->mapping = ctx.mapping;
 		dump->codepoints = ctx.Y;
 		++dump->generation;
+		TIMER_END(TrainingDump);
 	}
-	//}
+#undef EIGEN_USE_AVX512_GEMM_KERNELS
+#define EIGEN_USE_AVX512_GEMM_KERNELS 0
 }
 

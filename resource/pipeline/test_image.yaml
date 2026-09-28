@@ -1,0 +1,3 @@
+shaders:
+  vert: core://shader/screen_quad2.vert
+  frag: cap://shader/map_image.frag

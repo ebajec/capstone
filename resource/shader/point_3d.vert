@@ -39,7 +39,7 @@ void main()
 
 	vec3 value = get_value(idx);
 
-	vec3 pos = value;//get_pos_grid(idx);
+	vec3 pos = value;
 	uint mapping = pc.mapping.data[idx];
 
 	float aspect = u_view.p[0][0]/u_view.p[1][1];

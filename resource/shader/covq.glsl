@@ -16,6 +16,8 @@ layout (buffer_reference, std430, buffer_reference_align = 16) readonly buffer C
 	uint data[];
 };
 
+const uint USE_HASH_COLORS_BIT = 0x1;
+
 layout (push_constant) uniform PC {
 	Points points;
 	Mapping mapping;
@@ -23,6 +25,9 @@ layout (push_constant) uniform PC {
 	uint count;
 	float w;
 	int stride;
+	uint flags;
+	uint image_start;
+	uint image_end;
 	ivec2 size;
 } pc;
 
