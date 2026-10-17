@@ -41,26 +41,67 @@ struct Image
 	constexpr size_t nbytes() const {return w * h * sizeof(uint32_t);}
 };
 
-Eigen::MatrixXd bsc_matrix(uint32_t N, double eps)
+// @param k - number of codeword bits
+Eigen::MatrixXd bsc_matrix(uint32_t k, double eps)
 {
+	uint32_t N = 1 << k;
 	Eigen::MatrixXd P (N, N);
-
-	uint32_t k = std::bit_width(N) - 1;
 
 	for (uint32_t i = 0; i < N; ++i) {
 		for (uint32_t j = 0; j < N; ++j) {
 			uint32_t d = i ^ j;
-			uint32_t ones = std::popcount(d);
+			uint32_t nb_diff = std::popcount(d);
 
 			double p_j_i = 1.0; 
 
-			for (uint32_t l = 0; l < ones; ++l)
+			for (uint32_t l = 0; l < nb_diff; ++l)
 				p_j_i *= eps;
-			for (uint32_t l = 0; l < k - ones; ++l)
+			for (uint32_t l = 0; l < k - nb_diff; ++l)
 				p_j_i *= (1.0 - eps);
 
 			P(i, j) = p_j_i;
 		}
+	}
+
+	return P;
+}
+
+Eigen::MatrixXd nec_matrix(int k, double eps1, double eps2)
+{
+	uint32_t N = 1;
+	for (int i = 0; i < k; ++i)
+		N *= 3;
+
+	uint32_t M = (1 << k);
+	Eigen::MatrixXd P (M, N);
+	Eigen::VectorXd test (M);
+
+	for (uint32_t i = 0; i < M; ++i) {
+		uint32_t ones = 0, twos = 0;
+
+		double sum = 0;
+		for (uint32_t j = 0; j < N; ++j) {
+			int nb_diff = std::popcount(ones ^ (i & (~twos)));
+			int nb_err = std::popcount(twos);
+
+			uint32_t b = (twos + 1) & (~twos);
+			twos &= twos + 1;
+			twos |= ones & b;
+			ones ^= b;
+
+			double p_j_i = 1.0; 
+
+			for (int l = 0; l < nb_diff; ++l)
+				p_j_i *= eps1;
+			for (int l = 0; l < nb_err; ++l)
+				p_j_i *= eps2;
+			for (int l = 0; l < k - nb_diff - nb_err; ++l)
+				p_j_i *= (1.0 - eps1 - eps2);
+
+			P(i, j) = p_j_i;
+			sum += p_j_i;
+		}
+		test(i) = sum;
 	}
 
 	return P;
@@ -95,7 +136,7 @@ Eigen::MatrixXd images_to_matrix(std::span<const Image> images)
 
 	for (const Image &img : images) {
 		num_pix += img.w * img.h;
-		assert(img.format == IMAGE_FORMAT_RGB8);
+		assert(img.format == IMAGE_FORMAT_RGBA8);
 	}
 
 	Eigen::MatrixXd X (dim, num_pix);
@@ -141,9 +182,15 @@ void eigen_to_rgba8(const Eigen::MatrixXd &data, uint32_t *out)
 
 struct COVQParams
 {
-	int N;
+	int nb_bits;
 	double eps;
 };
+
+Eigen::MatrixXd transition_matrix(const COVQParams &params)
+{
+	return nec_matrix(params.nb_bits, 0, params.eps);
+}
+
 
 struct Visualizer;
 
@@ -158,15 +205,17 @@ struct COVQTrainingApp
 	std::atomic_uint32_t desired_its = 0;
 	std::atomic_bool run_continuously = false;
 
-	COVQParams quant;
+	COVQParams covq_params;
 
 	std::unique_ptr<COVQTrainingContext> trainer;
 
 	Eigen::MatrixXd X;
 	Eigen::MatrixXd P;
 
-	std::mutex sync;
+	std::mutex training_sync;
 	std::thread training_thread;
+
+	std::mutex sync;
 
 	std::vector<uint32_t> mapping;
 	Eigen::MatrixXd codepoints;
@@ -264,13 +313,13 @@ COVQTrainingApp::~COVQTrainingApp()
 
 int COVQTrainingApp::reset_quantizer()
 {
-	P = bsc_matrix(quant.N, quant.eps);
 	{
-		std::unique_lock<std::mutex> lock(sync);
+		P = transition_matrix(covq_params);
+		std::unique_lock<std::mutex> lock(training_sync);
 		trainer.reset(covq_init(X, P));
 	}
 
-	init_gpu_resources_for_training(quant);
+	init_gpu_resources_for_training(covq_params);
 
 	desired_its.store(0);
 	completed_its.store(0);
@@ -282,10 +331,10 @@ int COVQTrainingApp::reset_quantizer()
 
 int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> && in_images)
 {
-	quant = in_params;
+	covq_params = in_params;
 	images = std::move(in_images);
 
-	params.eps_slider = quant.eps;
+	params.eps_slider = covq_params.eps;
 
 	X = images_to_matrix(images);
 
@@ -301,7 +350,11 @@ int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> 
 			uint32_t desired = desired_its.load(); 
 
 			if (completed <= desired) {
-				std::unique_lock<std::mutex> lock(sync);
+				{
+					std::unique_lock<std::mutex> lock(sync);
+					trainer->P = this->P;
+				}
+				std::unique_lock<std::mutex> lock(training_sync);
 				uint32_t it = completed_its++;
 				printf("Iteration: %d\n", it);
 				covq_training_it(*trainer, X, dump.get());
@@ -462,7 +515,7 @@ int COVQTrainingApp::update()
 	if (dump && dump->generation > dump_generation) {
 		{
 			std::unique_lock<std::mutex> lock(dump->sync);
-			mapping = std::move(dump->mapping);
+			mapping = std::move(dump->codewords);
 			codepoints = std::move(dump->codepoints);
 			dump_generation = dump->generation;
 		}
@@ -497,9 +550,7 @@ int COVQTrainingApp::update()
 		desired_its.notify_one();
 	}
 
-	if (ImGui::SliderFloat("Epsilon", &params.eps_slider, 0.f, 1.f)) {
-		quant.eps = params.eps_slider;
-	}
+	ImGui::SliderFloat("Epsilon", &params.eps_slider, 0.f, 1.f);
 
 	if (ImGui::Button("Reset quantizer")) {
 		reset_quantizer();
@@ -532,6 +583,12 @@ int COVQTrainingApp::update()
 		params.selected_image = new_image;
 	}
 
+	if (params.eps_slider != covq_params.eps) {
+		std::unique_lock<std::mutex> lock(sync);
+		P = transition_matrix(covq_params);
+		covq_params.eps = params.eps_slider;
+	}
+
 	ImGui::End();
 
 	if (!points_gpu.is_valid())
@@ -550,10 +607,12 @@ int COVQTrainingApp::init_gpu_resources_for_training(const COVQParams &covq)
 {
 	if (codepoints_gpu.is_valid())
 		ev2::destroy_buffer(ctx, codepoints_gpu);
-	codepoints_gpu = ev2::create_buffer(ctx, covq.N * sizeof(uint32_t),
+
+	size_t codepoints_size = P.cols() * sizeof(uint32_t);
+	codepoints_gpu = ev2::create_buffer(ctx, codepoints_size,
 		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-	gpu_buffer_zero(codepoints_gpu, covq.N * sizeof(uint32_t));
+	gpu_buffer_zero(codepoints_gpu, codepoints_size);
 	pc.codepoints = ev2::get_buffer_device_address(ctx, codepoints_gpu);
 
 	return 0;
@@ -622,7 +681,7 @@ static inline int add_project_mounts(ev2::GfxContext *ctx)
 int main(int argc, char *argv[])
 {
 	int status = 0;
-	if ((status = ev2::editor::init(argc, argv, "test", 1200, 800)); status != ev2::SUCCESS) {
+	if ((status = ev2::editor::init(argc, argv, "test", 1800, 800)); status != ev2::SUCCESS) {
 		return status;
 	}
 	add_project_mounts(ev2::editor::ctx());
@@ -630,7 +689,7 @@ int main(int argc, char *argv[])
 	uint32_t jobs = 1;
 
 	COVQParams params = {
-		.N = (1 << 8),
+		.nb_bits = 8,
 		.eps = 0.05
 	};
 
@@ -643,8 +702,8 @@ int main(int argc, char *argv[])
 				std::thread::hardware_concurrency()
 			);
 		}
-		else if (!strcmp(argv[i], "-N") && i + 1 < argc) {
-			params.N = (uint32_t)strtol(argv[++i], NULL, 10);
+		else if (!strcmp(argv[i], "-bits") && i + 1 < argc) {
+			params.nb_bits = (uint32_t)strtol(argv[++i], NULL, 10);
 		}
 		else if (!strcmp(argv[i], "-eps") && i + 1 < argc) {
 			params.eps = strtod(argv[++i], NULL);

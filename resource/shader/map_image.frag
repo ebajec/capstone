@@ -24,12 +24,12 @@ uint get_mapping(uint idx)
 void main()
 {
 	ivec2 size = pc.size; 
-	ivec2 texc = ivec2(in_uv * vec2(size) + vec2(0.5)); 
+	ivec2 texc = ivec2(in_uv * vec2(size)); 
 
 	uint idx = uint(texc.x + texc.y * pc.size.x);
 	uint map = get_mapping(idx);
 
-	uint Y = pc.centroids.data[min(map, 255)];
+	uint Y = pc.centroids.data[map];
 
 	vec3 rgb = bool(pc.flags & USE_HASH_COLORS_BIT) ? 
 		unpackUnorm4x8(Y).rgb :

@@ -16,8 +16,8 @@ uint pcg_hash(uint v) {
 void main()
 {
 	//vec3 rgb = in_orig;
-	vec3 rgb = unpackUnorm4x8(pcg_hash(in_idx)).rgb;
-	//vec3 rgb = unpackUnorm4x8(pc.centroids.data[in_idx]).rgb;
+	//vec3 rgb = unpackUnorm4x8(pcg_hash(in_idx)).rgb;
+	vec3 rgb = unpackUnorm4x8(pc.centroids.data[in_idx]).rgb;
 
 	out_color = vec4(rgb,1);
 }

@@ -22,6 +22,12 @@ vec3 get_value(uint idx)
 	return unpackUnorm4x8(pc.points.data[idx]).rgb;
 }
 
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
 void main()
 {
 	const vec2 corners[4] = {
@@ -37,9 +43,11 @@ void main()
 		idx = min(idx * uint(pc.stride), pc.count - 1);
 	}
 
+	vec3 rand_offset = (vec3(1.f) - 2.f * unpackUnorm4x8(pcg_hash(idx)).rgb)/255.f;
+
 	vec3 value = get_value(idx);
 
-	vec3 pos = value;
+	vec3 pos = value + rand_offset;
 	uint mapping = pc.mapping.data[idx];
 
 	float aspect = u_view.p[0][0]/u_view.p[1][1];

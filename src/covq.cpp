@@ -12,11 +12,6 @@ static void split_heuristic_rec(
 	if (n < 2 || depth == 0)
 		return;
 
-	unsigned dst = (*idx)++;
-	if (dst >= K) {
-		return;
-	}
-
     Eigen::VectorXd mu = X.rowwise().mean();
 
     Eigen::MatrixXd Xc = X.colwise() - mu;
@@ -52,7 +47,13 @@ static void split_heuristic_rec(
 	// don't need this anymore
 	Xc.resize(0,0);
 
-	out.col(dst) = mu;
+	if (depth == 1) {
+		unsigned dst = (*idx)++;
+		if (dst >= K) {
+			return;
+		}
+		out.col(dst) = mu;
+	}
 
 	if (i == 0 || i == n)
 		return;
@@ -61,7 +62,7 @@ static void split_heuristic_rec(
 	split_heuristic_rec(X.rightCols(n - i), out, its, K, idx, depth - 1);
 }
 
-static Eigen::MatrixXd split_heuristic(Eigen::MatrixXd &X, unsigned K)
+static Eigen::MatrixXd split_heuristic_internal(Eigen::MatrixXd &X, unsigned K)
 {
 	int dims = X.rows();
 	Eigen::MatrixXd out = Eigen::MatrixXd(dims, K); 
@@ -74,17 +75,23 @@ static Eigen::MatrixXd split_heuristic(Eigen::MatrixXd &X, unsigned K)
 	return out;
 }
 
-Eigen::MatrixXd covq_init_centers(
+static Eigen::MatrixXd split_heuristic(
 	const Eigen::MatrixXd& X,
-	const Eigen::MatrixXd &P
+	int N
 )
 {
-	assert(P.rows() == P.cols());
-	int N = P.rows();
-
 	// gets rearranged in place
 	Eigen::MatrixXd X2 = X;
-	return split_heuristic(X2, N);
+	return split_heuristic_internal(X2, N);
+}
+
+constexpr uint32_t bits_to_base_3(uint32_t w, int k)
+{
+	uint64_t v = 0;
+	for (int i = k - 1; i >= 0;  --i) {
+		v = 3 * v + ((w >> i) & 1);
+	}
+	return v;
 }
 
 COVQTrainingContext *covq_init(
@@ -96,7 +103,8 @@ COVQTrainingContext *covq_init(
 
 	uint32_t count = X.cols();
 	uint32_t dim = X.rows();
-	uint32_t N = P.rows();
+	uint32_t M = P.rows();
+	uint32_t N = P.cols();
 
 	uint32_t numthread = omp_get_num_threads();
 
@@ -104,22 +112,41 @@ COVQTrainingContext *covq_init(
 		.count = count,
 		.dim = dim,
 		.N = N,
+		.M = M,
+		.word_length = (uint32_t)(std::bit_width(M) - 1),
+		.index_mapping = N == M ? nullptr : &bits_to_base_3,
 
 		.P = P,
-		.E = Eigen::MatrixXd::Zero(dim, N), 
-		.v = Eigen::VectorXd::Zero(N), 
+		.E = Eigen::MatrixXd::Zero(dim, M), 
+		.v = Eigen::VectorXd::Zero(M), 
 
-		.S_wts = Eigen::MatrixXd::Zero(1, N),
-		.S_centers = Eigen::MatrixXd::Zero(dim, N),
+		.S_probs = Eigen::MatrixXd::Zero(1, M),
 
-		.d = Eigen::VectorXd::Zero(N),
+		// dims * M
+		.S_centers = split_heuristic(X, M),
 
 		.mapping = std::vector<uint32_t>(count, 0),
 	};
 
-	ctx->Y = covq_init_centers(X, P);
+	Eigen::VectorXd d = Eigen::VectorXd::Zero(M);
+	for (Eigen::Index idx = 0; idx < X.cols(); ++idx) {
+		d.noalias() = (ctx->S_centers.colwise() - X.col(idx)).colwise().squaredNorm(); 
+		uint32_t argmin = 0;
+		d.minCoeff(&argmin);
+		ctx->S_probs(0, argmin) += 1;
+	}
+
+	const double p_x = 1.0/(double)X.cols();
+	
+	ctx->S_probs *= p_x;
+	ctx->S_centers *= p_x;
 
 	return ctx;
+}
+
+static uint32_t covq_index_mapping(const COVQTrainingContext &ctx, uint32_t i)
+{
+	return ctx.index_mapping ? ctx.index_mapping(i, ctx.word_length) : i;
 }
 
 // @param X - (dim , count) input dataset
@@ -135,15 +162,27 @@ void covq_training_it(
 
 	TIMER_BEGIN(TrainingIteration);
 
-	// compute E and v based on the codepoints from the previous iteration
-	
+	ctx.Y.setZero();
+	ctx.Y.noalias() = ctx.S_centers * ctx.P;
+
+	for (uint32_t j = 0; j < ctx.N; ++j) {
+		double prob_j = (ctx.S_probs * ctx.P.col(j))(0,0);
+
+		// TODO: Ignore when probability is near zero
+		if (fabs(prob_j) < 1e-8) {
+			ctx.Y.col(j).setZero();
+		} else {
+			ctx.Y.col(j) /= prob_j;
+		}
+	}
+
 	ctx.E.noalias() = ctx.Y * ctx.P.transpose();
 	ctx.v.noalias() = ctx.P * ctx.Y.colwise().squaredNorm().transpose();
 
 	TIMER_BEGIN(Centroids);
 	#pragma omp parallel
 	{
-		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(ctx.N);
+		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(ctx.M);
 
 		#pragma omp for schedule(dynamic)
 		for (uint32_t c = 0; c < ctx.count; ++c) {
@@ -153,46 +192,41 @@ void covq_training_it(
 			d_tls.minCoeff(&argmin);
 
 			uint32_t idx = argmin;
-			ctx.mapping[c] = argmin;
+			ctx.mapping[c] = idx;
 		}
 	}
 	TIMER_END(Centroids);
 
 	// accumulate partition centroids
 	ctx.S_centers.setZero();
-	ctx.S_wts.setZero();
+	ctx.S_probs.setZero();
 
 	for (uint32_t c = 0; c < ctx.count; ++c) {
 		uint32_t idx = ctx.mapping[c];
-		ctx.S_wts(0, idx) += 1.0;
+		ctx.S_probs(0, idx) += 1.0;
 		ctx.S_centers.col(idx).noalias() += X.col(c);
 	}
 
 	const double p_x = 1.0 / X.cols(); 
 
-	ctx.S_wts *= p_x;
+	ctx.S_probs *= p_x;
 	ctx.S_centers *= p_x;
-
-	ctx.Y.setZero();
-	ctx.Y.noalias() = ctx.S_centers * ctx.P;
-
-	for (uint32_t j = 0; j < ctx.N; ++j) {
-		double den = (ctx.S_wts * ctx.P.col(j))(0,0);
-
-		// TODO: Ignore partitions with zero elements
-		if (fabs(den) < 1e-6) {
-			ctx.Y.col(j).setZero();
-		} else {
-			ctx.Y.col(j) /= den;
-		}
-	}
 
 	TIMER_END(TrainingIteration);
 
 	if (dump) {
 		std::unique_lock<std::mutex> lock(dump->sync);
 		TIMER_BEGIN(TrainingDump);
-		dump->mapping = ctx.mapping;
+
+		dump->codewords.clear();
+		dump->codewords.reserve(ctx.mapping.size());
+
+		uint32_t k = std::bit_width(ctx.M) - 1;
+
+		for (uint32_t idx : ctx.mapping) {
+			uint32_t codeword = covq_index_mapping(ctx, idx);
+			dump->codewords.push_back(codeword);
+		}
 		dump->codepoints = ctx.Y;
 		++dump->generation;
 		TIMER_END(TrainingDump);
