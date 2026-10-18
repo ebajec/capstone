@@ -14,6 +14,12 @@ static void split_heuristic_rec(
 
     Eigen::VectorXd mu = X.rowwise().mean();
 
+	unsigned dst = (*idx)++;
+	if (dst >= K) {
+		return;
+	}
+	out.col(dst) = mu;
+
     Eigen::MatrixXd Xc = X.colwise() - mu;
     Eigen::VectorXd mu_test = Xc.rowwise().minCoeff();
     Eigen::VectorXd u = Eigen::VectorXd::Random(X.rows()).normalized();
@@ -46,14 +52,6 @@ static void split_heuristic_rec(
 
 	// don't need this anymore
 	Xc.resize(0,0);
-
-	if (depth == 1) {
-		unsigned dst = (*idx)++;
-		if (dst >= K) {
-			return;
-		}
-		out.col(dst) = mu;
-	}
 
 	if (i == 0 || i == n)
 		return;

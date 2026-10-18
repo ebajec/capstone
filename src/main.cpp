@@ -188,7 +188,7 @@ struct COVQParams
 
 Eigen::MatrixXd transition_matrix(const COVQParams &params)
 {
-	return nec_matrix(params.nb_bits, 0, params.eps);
+	return nec_matrix(params.nb_bits, params.eps, 0.5*params.eps);
 }
 
 
