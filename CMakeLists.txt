@@ -1,8 +1,16 @@
 cmake_minimum_required(VERSION 3.27)
+
+# --- Project ---
+
+set(CMAKE_C_STANDARD 17)
 set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install)
 
 set(TARGET covq)
-project(${TARGET})
+project(${TARGET} LANGUAGES C CXX)
 
 file(GLOB SOURCES "*.cpp" "*.c")
 
@@ -42,6 +50,54 @@ target_link_libraries(${TARGET} PRIVATE
 	ev2-engine
 )
 
+ev2_add_mount(${TARGET} NAME cap DIR resource)
+
+# --- Subdirs ---
+
 add_subdirectory(external/ev2)
 
-ev2_add_mount(${TARGET} NAME cap DIR resource)
+# --- Platform ---
+
+if(UNIX)
+    set(BUILD_SHARED_LIBS OFF)
+    
+    set(CMAKE_INSTALL_BINDIR bin)
+    set(CMAKE_INSTALL_LIBDIR lib)
+
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin) # Target
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib) # Shared libs
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib) # Static libs
+
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
+
+    if(APPLE)
+        # Fix for Xcode
+        foreach(CONFIG Debug Release RelWithDebInfo MinSizeRel)
+            string(TOUPPER ${CONFIG} CONFIG_UPPER)
+            set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${CONFIG_UPPER} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+            set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${CONFIG_UPPER} ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+            set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${CONFIG_UPPER} ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
+        endforeach()
+
+        # Ensure homebrew packages are discoverable
+        list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
+        set(CMAKE_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
+
+        # Fix for homebrew's libomp
+        if(NOT DEFINED OpenMP_ROOT)
+            find_program(HOMEBREW_EXECUTABLE brew)
+            if(HOMEBREW_EXECUTABLE)
+                execute_process(
+                    COMMAND "${HOMEBREW_EXECUTABLE}" --prefix libomp
+                    OUTPUT_VARIABLE HOMEBREW_LIBOMP_PREFIX
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET
+                    RESULT_VARIABLE HOMEBREW_LIBOMP_RESULT
+                )
+                if(HOMEBREW_LIBOMP_RESULT EQUAL 0)
+                    set(OpenMP_ROOT "${HOMEBREW_LIBOMP_PREFIX}")
+                endif()
+            endif()
+        endif()
+    endif()
+endif()
