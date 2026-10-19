@@ -50,11 +50,14 @@ target_link_libraries(${TARGET} PRIVATE
 	ev2-engine
 )
 
-ev2_add_mount(${TARGET} NAME cap DIR resource)
 
 # --- Subdirs ---
 
 add_subdirectory(external/ev2)
+
+# --- Resources ---
+
+ev2_add_mount(${TARGET} NAME cap DIR resource)
 
 # --- Platform ---
 
