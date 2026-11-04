@@ -4,7 +4,7 @@
 #include <ev2/editor.h>
 #include <ev2/viewport.h>
 #include <ev2/motion_camera.h>
-#include <ev2/pipeline.h>
+#include <ev2/core.h>
 #include <ev2/image_viewer.h>
 #include <ev2/utils/log.h>
 

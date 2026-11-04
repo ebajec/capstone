@@ -1,10 +1,10 @@
 #version 430 core
 #extension GL_GOOGLE_include_directive : require
 
-#include "core/shader/frame.glsl"
+#include "core/shader/core.glsl"
 #include "cap/shader/covq.glsl"
 
-layout (set = PER_DRAW_SET, binding = 0) uniform sampler2D u_tex;
+layout (set = EV2_BASE_USER_SET, binding = 0) uniform sampler2D u_tex;
 
 layout (location = 0) in vec2 in_pos;
 layout (location = 1) in vec2 in_uv;

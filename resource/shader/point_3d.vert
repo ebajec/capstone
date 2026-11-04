@@ -1,7 +1,7 @@
 #version 430 core
 #extension GL_GOOGLE_include_directive : require
 
-#include "core/shader/frame.glsl"
+#include "core/shader/core.glsl"
 #include "cap/shader/covq.glsl"
 
 layout (location = 0) flat out uint out_idx;
@@ -50,10 +50,10 @@ void main()
 	vec3 pos = value + rand_offset;
 	uint mapping = pc.mapping.data[idx];
 
-	float aspect = u_view.p[0][0]/u_view.p[1][1];
+	float aspect = u_pass.p[0][0]/u_pass.p[1][1];
 	vec2 scale = vec2(pc.w*aspect, pc.w);
 
-	vec4 cs_pos = u_view.pv * vec4(pos, 1);
+	vec4 cs_pos = u_pass.pv * vec4(pos, 1);
 	cs_pos.xy += scale * corners[gl_VertexIndex & 0x3];
 
 	out_idx = mapping;
