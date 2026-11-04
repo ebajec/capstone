@@ -25,20 +25,15 @@ void c_deleter(void *p)
 	free(p);
 }
 
-enum ImageFormat
-{
-	IMAGE_FORMAT_RGBA8
-};
-
 struct Image
 {
 	std::string path;
 	std::unique_ptr<uint8_t[], decltype(&c_deleter)> bytes {nullptr, &c_deleter};
 	uint32_t w;
 	uint32_t h;
-	ImageFormat format;
+	uint32_t ch;
 
-	constexpr size_t nbytes() const {return w * h * sizeof(uint32_t);}
+	constexpr size_t nbytes() const {return w * h * ch;}
 };
 
 // @param k - number of codeword bits
@@ -118,7 +113,7 @@ int load_image(const char *path, Image *out)
 			.bytes = {bytes, &c_deleter},
 			.w = (uint32_t)w,
 			.h = (uint32_t)h,
-			.format = IMAGE_FORMAT_RGBA8,
+			.ch = 4,
 		};
 		printf("Loaded image: %s\n", path);
 		return 0;
@@ -136,7 +131,7 @@ Eigen::MatrixXd images_to_matrix(std::span<const Image> images)
 
 	for (const Image &img : images) {
 		num_pix += img.w * img.h;
-		assert(img.format == IMAGE_FORMAT_RGBA8);
+		assert(img.ch == 4);
 	}
 
 	Eigen::MatrixXd X (dim, num_pix);
@@ -505,7 +500,7 @@ void COVQTrainingApp::render_image()
 int COVQTrainingApp::update()
 {
 	int status = ev2::SUCCESS;
-	if (viewport->imgui(nullptr) < ev2::SUCCESS)
+	if (viewport->update(nullptr) < ev2::SUCCESS)
 		return status;
 
 	if (image_viewer.expired()) {

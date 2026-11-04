@@ -2,6 +2,8 @@
 
 #include <cassert>
 
+#define ZERO_PROB_THRESHOLD 1e-9
+
 static void split_heuristic_rec(
 	Eigen::Ref<Eigen::MatrixXd> X,
 	Eigen::Ref<Eigen::MatrixXd> out,
@@ -16,6 +18,7 @@ static void split_heuristic_rec(
 
 	unsigned dst = (*idx)++;
 	if (dst >= K) {
+		printf("Done\n");
 		return;
 	}
 	out.col(dst) = mu;
@@ -112,39 +115,39 @@ COVQTrainingContext *covq_init(
 		.N = N,
 		.M = M,
 		.word_length = (uint32_t)(std::bit_width(M) - 1),
-		.index_mapping = N == M ? nullptr : &bits_to_base_3,
+		.output_index_mapping = N == M ? nullptr : &bits_to_base_3,
 
 		.P = P,
 		.E = Eigen::MatrixXd::Zero(dim, M), 
 		.v = Eigen::VectorXd::Zero(M), 
 
-		.S_probs = Eigen::MatrixXd::Zero(1, M),
+		.probs = Eigen::MatrixXd::Zero(1, M),
 
 		// dims * M
-		.S_centers = split_heuristic(X, M),
+		.centroids = split_heuristic(X, M),
 
 		.mapping = std::vector<uint32_t>(count, 0),
 	};
 
 	Eigen::VectorXd d = Eigen::VectorXd::Zero(M);
 	for (Eigen::Index idx = 0; idx < X.cols(); ++idx) {
-		d.noalias() = (ctx->S_centers.colwise() - X.col(idx)).colwise().squaredNorm(); 
+		d.noalias() = (ctx->centroids.colwise() - X.col(idx)).colwise().squaredNorm(); 
 		uint32_t argmin = 0;
 		d.minCoeff(&argmin);
-		ctx->S_probs(0, argmin) += 1;
+		ctx->probs(0, argmin) += 1;
 	}
 
 	const double p_x = 1.0/(double)X.cols();
 	
-	ctx->S_probs *= p_x;
-	ctx->S_centers *= p_x;
+	ctx->probs *= p_x;
+	ctx->centroids *= p_x;
 
 	return ctx;
 }
 
 static uint32_t covq_index_mapping(const COVQTrainingContext &ctx, uint32_t i)
 {
-	return ctx.index_mapping ? ctx.index_mapping(i, ctx.word_length) : i;
+	return ctx.output_index_mapping ? ctx.output_index_mapping(i, ctx.word_length) : i;
 }
 
 // @param X - (dim , count) input dataset
@@ -161,13 +164,13 @@ void covq_training_it(
 	TIMER_BEGIN(TrainingIteration);
 
 	ctx.Y.setZero();
-	ctx.Y.noalias() = ctx.S_centers * ctx.P;
+	ctx.Y.noalias() = ctx.centroids * ctx.P;
 
 	for (uint32_t j = 0; j < ctx.N; ++j) {
-		double prob_j = (ctx.S_probs * ctx.P.col(j))(0,0);
+		double prob_j = (ctx.probs * ctx.P.col(j))(0,0);
 
 		// TODO: Ignore when probability is near zero
-		if (fabs(prob_j) < 1e-8) {
+		if (fabs(prob_j) < ZERO_PROB_THRESHOLD) {
 			ctx.Y.col(j).setZero();
 		} else {
 			ctx.Y.col(j) /= prob_j;
@@ -196,19 +199,19 @@ void covq_training_it(
 	TIMER_END(Centroids);
 
 	// accumulate partition centroids
-	ctx.S_centers.setZero();
-	ctx.S_probs.setZero();
+	ctx.centroids.setZero();
+	ctx.probs.setZero();
 
 	for (uint32_t c = 0; c < ctx.count; ++c) {
 		uint32_t idx = ctx.mapping[c];
-		ctx.S_probs(0, idx) += 1.0;
-		ctx.S_centers.col(idx).noalias() += X.col(c);
+		ctx.probs(0, idx) += 1.0;
+		ctx.centroids.col(idx).noalias() += X.col(c);
 	}
 
 	const double p_x = 1.0 / X.cols(); 
 
-	ctx.S_probs *= p_x;
-	ctx.S_centers *= p_x;
+	ctx.probs *= p_x;
+	ctx.centroids *= p_x;
 
 	TIMER_END(TrainingIteration);
 
@@ -231,5 +234,76 @@ void covq_training_it(
 	}
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 0
+}
+
+COVQCodec *covq_create_codec(const COVQTrainingContext &ctx)
+{
+	COVQCodec *codec = new COVQCodec{COVQCodec{
+		.dim = ctx.dim,
+		.N = ctx.N,
+		.M = ctx.M,
+		.word_length = ctx.word_length,
+
+		.codebook = ctx.Y,
+		.centroids = ctx.centroids,
+		.probs = ctx.probs,
+
+		.P = ctx.P
+	}};
+
+	return codec;
+}
+
+struct COVQEncoder *covq_create_encoder(const COVQCodec *codec)
+{
+	uint32_t nb_nonzero = 0;
+	for (uint32_t i = 0; i < codec->M; ++i) {
+		if (codec->probs(0, i) > 0.0)
+			++nb_nonzero;
+	}
+
+	Eigen::MatrixXd E = codec->codebook * codec->P.transpose();
+	Eigen::VectorXd v = codec->P * codec->codebook.colwise().squaredNorm().transpose();
+
+	std::vector<uint32_t> index_map (nb_nonzero);
+	Eigen::MatrixXd E_out(codec->dim, nb_nonzero);
+	Eigen::VectorXd v_out(nb_nonzero);
+
+	for (uint32_t i = 0, idx = 0; i < codec->M; ++i) {
+		if (codec->probs(0, i) > 0.0) {
+			index_map[idx] = i;
+			E_out.col(idx) = E.col(i);
+			v_out(idx) = v(i);
+			++idx;
+		}
+	}
+
+	return new COVQEncoder {
+		.dim = codec->dim,
+		.word_length = codec->word_length,
+		.E = std::move(E_out),
+		.v = std::move(v_out),
+		.index_map = std::move(index_map)
+	};
+}
+
+size_t covq_serialized_size(const COVQCodec &codec)
+{
+}
+
+int covq_serialize(const COVQCodec &codec, void *buf)
+{
+}
+
+int covq_deserialize(COVQCodec *codec, const void *buf)
+{
+}
+
+int covq_save(const COVQCodec *codec, const char *path)
+{
+}
+
+int covq_load(COVQCodec *codec, const char *path)
+{
 }
 

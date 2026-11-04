@@ -1,0 +1,5 @@
+shaders:
+  vert: core://shader/screen_quad.vert
+  frag: cap://shader/grid.frag
+input:
+  topology: TRIANGLE_STRIP
