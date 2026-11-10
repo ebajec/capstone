@@ -1,3 +1,6 @@
+#ifndef COVQ_GLSL
+#define COVQ_GLSL
+
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 
@@ -16,18 +19,4 @@ layout (buffer_reference, std430, buffer_reference_align = 16) readonly buffer C
 	uint data[];
 };
 
-const uint USE_HASH_COLORS_BIT = 0x1;
-
-layout (push_constant) uniform PC {
-	Points points;
-	Mapping mapping;
-	Centroids centroids;
-	uint count;
-	float w;
-	int stride;
-	uint flags;
-	uint image_start;
-	uint image_end;
-	ivec2 size;
-} pc;
-
+#endif // COVQ_GLSL

@@ -18,7 +18,6 @@
 #include <bit>
 #include <thread>
 #include <algorithm>
-#include <condition_variable>
 
 void c_deleter(void *p)
 {
@@ -175,6 +174,26 @@ void eigen_to_rgba8(const Eigen::MatrixXd &data, uint32_t *out)
 	}
 }
 
+static void gpu_upload_single(ev2::BufferID buf, void *data, size_t size)
+{
+	ev2::GfxContext *ctx = ev2::editor::ctx();
+	ev2::UploadContext uc = ev2::begin_upload(ctx, size, alignof(uint32_t));
+	memcpy(uc.ptr, data, size); 
+	ev2::BufferUpload up = {.size = size};
+	ev2::commit_buffer_uploads(ctx, uc, buf, &up, 1);
+	ev2::flush_uploads(ctx);
+}
+
+static void gpu_buffer_zero(ev2::BufferID buf, size_t size)
+{
+	ev2::GfxContext *ctx = ev2::editor::ctx();
+	ev2::UploadContext uc = ev2::begin_upload(ctx, size, alignof(uint32_t));
+	memset(uc.ptr, 0x0, size); 
+	ev2::BufferUpload up = {.size = size};
+	ev2::commit_buffer_uploads(ctx, uc, buf, &up, 1);
+	ev2::flush_uploads(ctx);
+}
+
 struct COVQParams
 {
 	int nb_bits;
@@ -186,47 +205,341 @@ Eigen::MatrixXd transition_matrix(const COVQParams &params)
 	return nec_matrix(params.nb_bits, params.eps, 0.5*params.eps);
 }
 
+// Renders the training dataset as a point cloud in RGB space, colored by the
+// partition each point is currently encoded tos.
+struct COVQTrainingVisualization
+{
+	// NOTE: must match point_viz.glsl
+	enum ColorMode : uint32_t {
+		// use point's value as the color
+		COLOR_MODE_VALUE = 0,
+		// a random color per partition cell
+		COLOR_MODE_CELL_HASH = 1,
+		// the reconstruction vector for the point's codeword
+		COLOR_MODE_CODEPOINT = 2,
+		COLOR_MODE_COUNT
+	};
 
-struct Visualizer;
+	// NOTE: must match point_viz.glsl
+	enum FlagBits : uint32_t {
+		JITTER_BIT = 0x1,
+		SNAP_TO_CODEPOINT_BIT = 0x2,
+	};
+
+	// NOTE: must match point_viz.glsl
+	struct alignas(8) PushConstants {
+		VkDeviceAddress points;
+		VkDeviceAddress codewords;
+		VkDeviceAddress codepoints;
+		uint32_t count;
+		uint32_t stride;
+		uint32_t num_codepoints;
+		uint32_t color_mode;
+		uint32_t flags;
+		float w;
+	};
+	static_assert(sizeof(PushConstants) == 48);
+
+	struct Options {
+		float point_size = 0.004f;
+		// log10 of the stride used to subsample the dataset
+		float log_stride = 1.f;
+		ColorMode color_mode = COLOR_MODE_CELL_HASH;
+		// spread points over their 8 bit quantization bin
+		bool jitter = true;
+		// draw each point at its reconstruction vector
+		bool snap_to_codepoint = false;
+	} opts;
+
+	ev2::GfxContext *gfx = nullptr;
+
+	uint32_t num_points = 0;
+	uint32_t num_codepoints = 0;
+
+	struct GpuData {
+		// dataset values (num_points)
+		ev2::BufferID points;
+		// channel output index each point is encoded to (num_points)
+		ev2::BufferID codewords;
+		// reconstruction vector for each channel output (num_codepoints)
+		ev2::BufferID codepoints;
+	} rd;
+
+	std::unique_ptr<ev2::Viewport> viewport;
+	std::shared_ptr<ev2::MotionCamera> camera;
+
+	static constexpr uint64_t INVALID_EPOCH = UINT64_MAX;
+	// training epoch that the GPU data was last synced with
+	uint64_t synced_epoch = INVALID_EPOCH;
+
+	// @param data - (3, count) dataset the trainer is run on
+	static COVQTrainingVisualization *create(const Eigen::MatrixXd &data);
+	~COVQTrainingVisualization();
+
+	// force a re-sync on the next update, e.g. after the trainer was replaced
+	void invalidate() { synced_epoch = INVALID_EPOCH; }
+
+	// sync with the trainer if it has progressed, and render. Call once per frame.
+	void update(COVQTrainingContext &trainer);
+
+	// draw the display options into the current ImGui window
+	void draw_gui();
+
+	void sync(COVQTrainingContext &trainer);
+	void render();
+
+	uint32_t stride() const;
+	uint32_t num_drawn_points() const;
+};
+
+COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::MatrixXd &data)
+{
+	assert(data.rows() == 3);
+
+	TIMER_BEGIN(VisualizationCreate);
+
+	COVQTrainingVisualization *viz = new COVQTrainingVisualization{};
+	ev2::GfxContext *gfx = viz->gfx = ev2::editor::ctx();
+
+	viz->viewport.reset(new ev2::Viewport("Visualization", 0, 0, 500, 500,
+		ev2::RENDER_TARGET_CREATE_DEPTH_BIT | ev2::RENDER_TARGET_CREATE_COLOR_BIT));
+	viz->camera.reset(new ev2::MotionCamera(glm::dvec3(0.5,0.5,0.5), glm::dvec3(-0.5,-0.5,1), glm::dvec3(0,0,1)));
+
+	viz->viewport->set_camera(viz->camera);
+	viz->viewport->set_closable(false);
+
+	viz->num_points = data.cols();
+	size_t points_size = viz->num_points * sizeof(uint32_t);
+
+	viz->rd.points = ev2::create_buffer(gfx, points_size,
+		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
+	viz->rd.codewords = ev2::create_buffer(gfx, points_size,
+		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+	ev2::UploadContext uc = ev2::begin_upload(gfx, points_size, alignof(uint32_t));
+	eigen_to_rgba8(data, reinterpret_cast<uint32_t*>(uc.ptr));
+	ev2::BufferUpload up = {.size = points_size};
+	ev2::commit_buffer_uploads(gfx, uc, viz->rd.points, &up, 1);
+	ev2::flush_uploads(gfx);
+
+	gpu_buffer_zero(viz->rd.codewords, points_size);
+
+	TIMER_END(VisualizationCreate);
+
+	return viz;
+}
+
+COVQTrainingVisualization::~COVQTrainingVisualization()
+{
+	for (ev2::BufferID buf : {rd.points, rd.codewords, rd.codepoints}) {
+		if (buf.is_valid())
+			ev2::destroy_buffer(gfx, buf);
+	}
+}
+
+uint32_t COVQTrainingVisualization::stride() const
+{
+	return std::max(1L, std::lround(std::pow(10.0, opts.log_stride)));
+}
+
+uint32_t COVQTrainingVisualization::num_drawn_points() const
+{
+	uint32_t s = stride();
+	return (num_points + s - 1) / s;
+}
+
+void COVQTrainingVisualization::sync(COVQTrainingContext &trainer)
+{
+	if (trainer.epoch.load() == synced_epoch)
+		return;
+
+	// Don't stall the frame waiting for a training iteration to finish,
+	// just pick up the results on a later frame.
+	std::unique_lock<std::mutex> lock(trainer.mutex, std::try_to_lock);
+	if (!lock.owns_lock())
+		return;
+
+	assert(trainer.mapping.size() == num_points);
+
+	if (num_codepoints != trainer.N || !rd.codepoints.is_valid()) {
+		num_codepoints = trainer.N;
+
+		if (rd.codepoints.is_valid())
+			ev2::destroy_buffer(gfx, rd.codepoints);
+
+		rd.codepoints = ev2::create_buffer(gfx, num_codepoints * sizeof(uint32_t),
+			ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
+	}
+
+	size_t codewords_size = num_points * sizeof(uint32_t);
+	ev2::UploadContext codewords_uc = ev2::begin_upload(gfx, codewords_size, alignof(uint32_t));
+	uint32_t *codewords = reinterpret_cast<uint32_t*>(codewords_uc.ptr);
+	for (uint32_t i = 0; i < num_points; ++i)
+		codewords[i] = covq_index_mapping(trainer, trainer.mapping[i]);
+
+	ev2::BufferUpload codewords_up = {.size = codewords_size};
+	ev2::commit_buffer_uploads(gfx, codewords_uc, rd.codewords, &codewords_up, 1);
+
+	size_t codepoints_size = num_codepoints * sizeof(uint32_t);
+	ev2::UploadContext codepoints_uc = ev2::begin_upload(gfx, codepoints_size, alignof(uint32_t));
+
+	// Y is empty until the first training iteration has run
+	if (trainer.Y.cols() == num_codepoints) {
+		assert(trainer.Y.rows() == 3);
+		eigen_to_rgba8(trainer.Y, reinterpret_cast<uint32_t*>(codepoints_uc.ptr));
+	} else {
+		memset(codepoints_uc.ptr, 0x0, codepoints_size);
+	}
+
+	ev2::BufferUpload codepoints_up = {.size = codepoints_size};
+	ev2::commit_buffer_uploads(gfx, codepoints_uc, rd.codepoints, &codepoints_up, 1);
+
+	synced_epoch = trainer.epoch.load();
+	lock.unlock();
+
+	ev2::flush_uploads(gfx);
+}
+
+void COVQTrainingVisualization::render()
+{
+	if (viewport->update(nullptr) < ev2::SUCCESS || !num_points)
+		return;
+
+	uint32_t flags = 0;
+	if (opts.jitter)
+		flags |= JITTER_BIT;
+	if (opts.snap_to_codepoint)
+		flags |= SNAP_TO_CODEPOINT_BIT;
+
+	bool has_codepoints = rd.codepoints.is_valid();
+
+	PushConstants pc = {
+		.points = ev2::get_buffer_device_address(gfx, rd.points),
+		.codewords = ev2::get_buffer_device_address(gfx, rd.codewords),
+		.codepoints = has_codepoints ?
+			ev2::get_buffer_device_address(gfx, rd.codepoints) : 0,
+		.count = num_points,
+		.stride = stride(),
+		.num_codepoints = has_codepoints ? num_codepoints : 0,
+		.color_mode = opts.color_mode,
+		.flags = flags,
+		.w = opts.point_size,
+	};
+
+	ev2::GfxPassInfo pass_info = {
+		.target = viewport->get_target(),
+		.view = viewport->get_view(),
+		.clear_color = true,
+		.clear_depth = true,
+		.name = "Visualization",
+	};
+
+	ev2::GfxPipelineID pipeline = ev2::load_graphics_pipeline(gfx, "cap://pipeline/training_viz.yaml");
+
+	ev2::PassID pass = ev2::begin_gfx_pass(gfx, &pass_info);
+	ev2::cmd_use_buffer(pass, rd.points, ev2::USAGE_STORAGE_READ_GRAPHICS);
+	ev2::cmd_use_buffer(pass, rd.codewords, ev2::USAGE_STORAGE_READ_GRAPHICS);
+	if (has_codepoints)
+		ev2::cmd_use_buffer(pass, rd.codepoints, ev2::USAGE_STORAGE_READ_GRAPHICS);
+	ev2::cmd_bind_gfx_pipeline(pass, pipeline);
+	ev2::cmd_push_constant(pass, pipeline, 0, sizeof(pc), &pc);
+	ev2::cmd_custom(pass, [count = num_drawn_points()](VkCommandBuffer cmds) {
+		vkCmdDraw(cmds, 4, count, 0, 0);
+	});
+	ev2::end_pass(gfx, pass);
+}
+
+void COVQTrainingVisualization::update(COVQTrainingContext &trainer)
+{
+	sync(trainer);
+	render();
+}
+
+void COVQTrainingVisualization::draw_gui()
+{
+	// indexed by ColorMode
+	static constexpr const char *color_mode_names[] = {
+		"Value",
+		"Cell hash",
+		"Codepoint",
+	};
+	static_assert(std::size(color_mode_names) == COLOR_MODE_COUNT);
+
+	ImGui::PushID("COVQTrainingVisualization");
+
+	ImGui::SeparatorText("Points");
+
+	ImGui::SliderFloat("Point size", &opts.point_size, 0.0005f, 0.05f, "%.4f",
+		ImGuiSliderFlags_Logarithmic);
+
+	ImGui::SliderFloat("Subsampling", &opts.log_stride, 0.f, 4.f, "10^%.2f");
+	ImGui::SetItemTooltip("Draw every n-th point of the dataset");
+	ImGui::TextDisabled("Drawing %u / %u points", num_drawn_points(), num_points);
+
+	ImGui::Checkbox("Jitter", &opts.jitter);
+	ImGui::SetItemTooltip("Spread points over their 8 bit quantization bin");
+
+	ImGui::SeparatorText("Partitions");
+
+	int color_mode = opts.color_mode;
+	if (ImGui::Combo("Color by", &color_mode, color_mode_names, COLOR_MODE_COUNT))
+		opts.color_mode = static_cast<ColorMode>(color_mode);
+
+	ImGui::Checkbox("Snap to codepoint", &opts.snap_to_codepoint);
+	ImGui::SetItemTooltip("Draw each point at the reconstruction vector of its codeword");
+
+	if (synced_epoch == INVALID_EPOCH)
+		ImGui::TextDisabled("Codepoints: %u (not synced)", num_codepoints);
+	else
+		ImGui::TextDisabled("Codepoints: %u (epoch %lu)", num_codepoints, synced_epoch);
+
+	ImGui::PopID();
+}
 
 struct COVQTrainingApp
 {
 	std::vector<Image> images;
 
-	uint32_t num_points = 0;
-	uint32_t dump_generation = 0;
-
-	std::atomic_uint32_t completed_its = 0;
-	std::atomic_uint32_t desired_its = 0;
-	std::atomic_bool run_continuously = false;
+	//--------------------------------------------------------------------------
+	// Training
 
 	COVQParams covq_params;
 
-	std::unique_ptr<COVQTrainingContext> trainer;
-
+	// (3, count) dataset built from all of the images
 	Eigen::MatrixXd X;
+	// channel matrix used for the next training iteration; guarded by `sync`
 	Eigen::MatrixXd P;
 
+	// replaced under `training_sync`
+	std::unique_ptr<COVQTrainingContext> trainer;
+	// guarded by `codec_sync`
+	std::unique_ptr<COVQCodec> codec;
+	// incremented every time `codec` is replaced
+	std::atomic_uint32_t epoch = 0;
+
+	std::atomic_uint32_t completed_its = 0;
+	std::atomic_uint32_t desired_its = 0;
+	bool run_continuously = false;
+
 	std::mutex training_sync;
+	std::mutex sync;
+	std::mutex codec_sync;
 	std::thread training_thread;
 
-	std::mutex sync;
+	std::atomic_bool should_close = false;
 
-	std::vector<uint32_t> mapping;
-	Eigen::MatrixXd codepoints;
+	//--------------------------------------------------------------------------
+	// Visualization
+
+	// null when the visualization is disabled
+	std::unique_ptr<COVQTrainingVisualization> training_viz;
+
+	//--------------------------------------------------------------------------
+	// Image display (WIP)
 
 	enum PushConstantFlags {
 		USE_HASH_COLORS_BIT = 0x1
 	};
-
-	std::unique_ptr<ev2::Viewport> viewport;
-	std::shared_ptr<ev2::MotionCamera> camera;
-	std::unique_ptr<COVQTrainingDump> dump;
-
-	ev2::BufferID points_gpu {};
-	ev2::BufferID mapping_gpu {};
-	ev2::BufferID codepoints_gpu {};
-	ev2::BufferID weights_gpu {};
 
 	ev2::ImageID disp_image {};
 	std::weak_ptr<ev2::ImageViewer> image_viewer {};
@@ -234,11 +547,10 @@ struct COVQTrainingApp
 	struct Params {
 		const Image *selected_image = nullptr;
 		bool use_quantized = false;
-		bool colorize_cells = false;
-		float point_density = 1.f;
 		float eps_slider = 0.05;
 	} params;
 
+	// must match map_image.frag
 	struct alignas(8) PushConstants {
 		VkDeviceAddress points;
 		VkDeviceAddress mapping;
@@ -257,43 +569,24 @@ struct COVQTrainingApp
 
 	ev2::GfxContext *ctx;
 
-	std::atomic_bool should_close = false;
-
 	COVQTrainingApp();
 	~COVQTrainingApp();
 	int initialize(const COVQParams &in_params, std::vector<Image> && in_images);
 	int update();
 
-	int init_gpu_resources_for_data(const Eigen::MatrixXd &data);
-	int init_gpu_resources_for_training(const COVQParams &covq);
+	int reset_quantizer();
+	void set_visualization_enabled(bool enabled);
 
-	int set_codepoints(const Eigen::MatrixXd &codepoints);
+	void draw_training_gui();
+	void draw_image_gui();
 
 	int view_image(const Image &image);
-
-	int reset_quantizer();
-
-	void render_points();
 	void render_image();
-};
-
-struct Visualizer
-{
-	COVQTrainingApp *app;
-
 };
 
 COVQTrainingApp::COVQTrainingApp()
 {
 	ctx = ev2::editor::ctx();
-
-	dump = std::make_unique<COVQTrainingDump>();
-	viewport.reset(new ev2::Viewport("Visualization", 0, 0, 500, 500,
-		ev2::RENDER_TARGET_CREATE_DEPTH_BIT | ev2::RENDER_TARGET_CREATE_COLOR_BIT));
-	camera.reset(new ev2::MotionCamera(glm::dvec3(0.5,0.5,0.5), glm::dvec3(-0.5,-0.5,1), glm::dvec3(0,0,1)));
-
-	viewport->set_camera(camera);
-	viewport->set_closable(false);
 }
 
 COVQTrainingApp::~COVQTrainingApp()
@@ -309,12 +602,18 @@ COVQTrainingApp::~COVQTrainingApp()
 int COVQTrainingApp::reset_quantizer()
 {
 	{
+		std::unique_lock<std::mutex> lock(sync);
 		P = transition_matrix(covq_params);
+	}
+
+	{
 		std::unique_lock<std::mutex> lock(training_sync);
 		trainer.reset(covq_init(X, P));
 	}
 
-	init_gpu_resources_for_training(covq_params);
+	// new trainer starts back at epoch 0
+	if (training_viz)
+		training_viz->invalidate();
 
 	desired_its.store(0);
 	completed_its.store(0);
@@ -322,6 +621,17 @@ int COVQTrainingApp::reset_quantizer()
 	desired_its.notify_one();
 
 	return 0;
+}
+
+void COVQTrainingApp::set_visualization_enabled(bool enabled)
+{
+	if (enabled == (training_viz != nullptr))
+		return;
+
+	if (enabled)
+		training_viz.reset(COVQTrainingVisualization::create(X));
+	else
+		training_viz.reset();
 }
 
 int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> && in_images)
@@ -333,26 +643,31 @@ int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> 
 
 	X = images_to_matrix(images);
 
-	TIMER_BEGIN(Uploading);
-	init_gpu_resources_for_data(X);
-	TIMER_END(Uploading);
-
 	reset_quantizer();
+
+	set_visualization_enabled(true);
 
 	training_thread = std::thread([this](){
 		while (!should_close) {
 			uint32_t completed = completed_its.load(); 
 			uint32_t desired = desired_its.load(); 
 
-			if (completed <= desired) {
+			if (completed < desired) {
+				std::unique_lock<std::mutex> lock(training_sync);
 				{
 					std::unique_lock<std::mutex> lock(sync);
 					trainer->P = this->P;
 				}
-				std::unique_lock<std::mutex> lock(training_sync);
+
 				uint32_t it = completed_its++;
 				printf("Iteration: %d\n", it);
-				covq_training_it(*trainer, X, dump.get());
+				covq_training_it(*trainer, X);
+
+				{
+					std::unique_lock<std::mutex> codec_lock(codec_sync);
+					this->codec.reset(covq_create_codec(*trainer));
+					++epoch;
+				}
 			} else{
 				printf("Next iteration: %d\n", desired + 1);
 				desired_its.wait(desired, std::memory_order_seq_cst);
@@ -361,27 +676,6 @@ int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> 
 	});
 
 	return 0;
-}
-
-
-void gpu_upload_single(ev2::BufferID buf, void *data, size_t size)
-{
-	ev2::GfxContext *ctx = ev2::editor::ctx();
-	ev2::UploadContext uc = ev2::begin_upload(ctx, size, alignof(uint32_t));
-	memcpy(uc.ptr, data, size); 
-	ev2::BufferUpload up = {.size = size};
-	ev2::commit_buffer_uploads(ctx, uc, buf, &up, 1);
-	ev2::flush_uploads(ctx);
-}
-
-void gpu_buffer_zero(ev2::BufferID buf, size_t size)
-{
-	ev2::GfxContext *ctx = ev2::editor::ctx();
-	ev2::UploadContext uc = ev2::begin_upload(ctx, size, alignof(uint32_t));
-	memset(uc.ptr, 0x0, size); 
-	ev2::BufferUpload up = {.size = size};
-	ev2::commit_buffer_uploads(ctx, uc, buf, &up, 1);
-	ev2::flush_uploads(ctx);
 }
 
 int COVQTrainingApp::view_image(const Image &in_image)
@@ -429,127 +723,53 @@ int COVQTrainingApp::view_image(const Image &in_image)
 	return 0;
 }
 
-int COVQTrainingApp::set_codepoints(const Eigen::MatrixXd &codepoints)
-{
-	int N = codepoints.cols();
-	size_t bytes = N * sizeof(uint32_t); 
-	assert(codepoints.rows() == 3);
-
-	ev2::UploadContext uc = ev2::begin_upload(ctx, bytes, alignof(glm::vec3));
-	eigen_to_rgba8(codepoints, reinterpret_cast<uint32_t*>(uc.ptr));
-	ev2::BufferUpload up = {
-		.size = bytes,
-	};
-	ev2::commit_buffer_uploads(ctx, uc, codepoints_gpu, &up, 1);
-	ev2::flush_uploads(ctx);
-
-	return 0;
-}
-
-void COVQTrainingApp::render_points()
-{
-	ev2::GfxPassInfo pass_info = {
-		.target = viewport->get_target(),
-		.view = viewport->get_view(),
-		.clear_color = true,
-		.clear_depth = true,
-		.name = "Visualization",
-	};
-
-	ev2::GfxPipelineID pipeline = ev2::load_graphics_pipeline(ctx, "cap://pipeline/training_viz.yaml");
-
-	ev2::PassID pass = ev2::begin_gfx_pass(ctx, &pass_info);
-	ev2::cmd_use_buffer(pass, points_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
-	ev2::cmd_use_buffer(pass, mapping_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
-	ev2::cmd_bind_gfx_pipeline(pass, pipeline);
-	ev2::cmd_push_constant(pass, pipeline, 0, sizeof(pc), &pc);
-	ev2::cmd_custom(pass, [count = pc.stride > 0 ? pc.count/pc.stride : pc.count](VkCommandBuffer cmds) {
-		vkCmdDraw(cmds, 4, count, 0, 0);
-	});
-	ev2::end_pass(ctx, pass);
-}
-
 void COVQTrainingApp::render_image()
 {
-	std::shared_ptr<ev2::ImageViewer> viewer = image_viewer.lock();
-	if (!viewer || !mapping_gpu.is_valid() || !codepoints_gpu.is_valid())
-		return;
+	return;
+	// disabled for now
 
-	ev2::GfxPassInfo pass_info = {
-		.target = viewer->get_target(),
-		.view = viewer->get_view(),
-		.clear_color = true,
-		.name = viewer->get_name(),
-	};
+	//std::shared_ptr<ev2::ImageViewer> viewer = image_viewer.lock();
+	//if (!viewer || !mapping_gpu.is_valid() || !codepoints_gpu.is_valid())
+	//	return;
 
-	ev2::GfxPipelineID test_pipeline =
-		ev2::load_graphics_pipeline(ctx, "cap://pipeline/test_image.yaml");
+	//ev2::GfxPassInfo pass_info = {
+	//	.target = viewer->get_target(),
+	//	.view = viewer->get_view(),
+	//	.clear_color = true,
+	//	.name = viewer->get_name(),
+	//};
 
-	ev2::PassID pass = ev2::begin_gfx_pass(ctx, &pass_info);
-	ev2::cmd_use_buffer(pass, mapping_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
-	ev2::cmd_use_buffer(pass, codepoints_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
+	//ev2::GfxPipelineID test_pipeline =
+	//	ev2::load_graphics_pipeline(ctx, "cap://pipeline/test_image.yaml");
 
-	if (viewer->get_pipeline() == test_pipeline) {
-		ev2::cmd_push_constant(pass, test_pipeline, 0, sizeof(pc), &pc);
-	}
-	viewer->record_draw(pass);
+	//ev2::PassID pass = ev2::begin_gfx_pass(ctx, &pass_info);
+	//ev2::cmd_use_buffer(pass, mapping_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
+	//ev2::cmd_use_buffer(pass, codepoints_gpu, ev2::USAGE_STORAGE_READ_GRAPHICS);
 
-	ev2::end_pass(ctx, pass);
+	//if (viewer->get_pipeline() == test_pipeline) {
+	//	ev2::cmd_push_constant(pass, test_pipeline, 0, sizeof(pc), &pc);
+	//}
+	//viewer->record_draw(pass);
+
+	//ev2::end_pass(ctx, pass);
 }
 
-int COVQTrainingApp::update()
+static void encode_image(const COVQCodec *codec, const Image &img, uint8_t *out)
 {
-	int status = ev2::SUCCESS;
-	if (viewport->update(nullptr) < ev2::SUCCESS)
-		return status;
 
-	if (image_viewer.expired()) {
-		params.selected_image = nullptr;
-	}
+}
 
-	if (dump && dump->generation > dump_generation) {
-		{
-			std::unique_lock<std::mutex> lock(dump->sync);
-			mapping = std::move(dump->codewords);
-			codepoints = std::move(dump->codepoints);
-			dump_generation = dump->generation;
-		}
-		assert(!mapping.empty());
-		gpu_upload_single(mapping_gpu, mapping.data(), mapping.size() * sizeof(uint32_t));
-		set_codepoints(codepoints);
-	}
-
-	ImGui::Begin("Editor");
-	ImGui::SliderFloat("Point Size", &pc.w, 0, 0.1);
-
-	ImGui::SliderFloat("-log(\%) Point Density", &params.point_density, 0.f, 4.f);
-
-	double min_density = std::max(1.0/double(num_points), 1e-9);
-
-	pc.stride = pow(10, params.point_density);
-
-	if (ImGui::RadioButton("Run Continuosly", run_continuously)) {
-		run_continuously = !run_continuously;
-	}
-
-	if (ImGui::RadioButton("Quantized colors", params.use_quantized)) {
-		params.use_quantized = !params.use_quantized;
-	}
-
-	if (ImGui::RadioButton("Colorize cells", params.colorize_cells)) {
-		params.colorize_cells = !params.colorize_cells;
-	}
-
-	if (run_continuously && desired_its <= completed_its) {
-		++desired_its;
-		desired_its.notify_one();
-	}
+void COVQTrainingApp::draw_training_gui()
+{
+	ImGui::Checkbox("Run continuously", &run_continuously);
 
 	ImGui::SliderFloat("Epsilon", &params.eps_slider, 0.f, 1.f);
 
 	if (ImGui::Button("Reset quantizer")) {
 		reset_quantizer();
 	}
+
+	ImGui::SameLine();
 
 	char label[100];
 	snprintf(label, sizeof(label), "Iteration: %d", desired_its.load()); 
@@ -558,97 +778,86 @@ int COVQTrainingApp::update()
 		++desired_its;
 		desired_its.notify_one();
 	}
+}
+
+void COVQTrainingApp::draw_image_gui()
+{
+	if (ImGui::RadioButton("Quantized colors", params.use_quantized)) {
+		params.use_quantized = !params.use_quantized;
+	}
 
 	const Image* new_image = params.selected_image;
 
-	if (ImGui::CollapsingHeader("Image Picker")) {
-		ImGui::Indent();
-		uint32_t idx = 0;
-		for (const Image &image : images) {
-			if (ImGui::Selectable(image.path.c_str(), params.selected_image == new_image)) {
-				new_image = &image;
-			}
-			++idx;
+	for (const Image &image : images) {
+		if (ImGui::Selectable(image.path.c_str(), params.selected_image == &image)) {
+			new_image = &image;
 		}
-		ImGui::Unindent();
 	}
 
 	if (new_image != params.selected_image) {
 		view_image(*new_image);
 		params.selected_image = new_image;
 	}
+}
 
-	if (params.eps_slider != covq_params.eps) {
-		std::unique_lock<std::mutex> lock(sync);
-		P = transition_matrix(covq_params);
-		covq_params.eps = params.eps_slider;
+int COVQTrainingApp::update()
+{
+	int status = ev2::SUCCESS;
+
+	if (image_viewer.expired()) {
+		params.selected_image = nullptr;
+	}
+
+	ImGui::Begin("Editor");
+
+	if (ImGui::CollapsingHeader("Training", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Indent();
+		draw_training_gui();
+		ImGui::Unindent();
+	}
+
+	if (ImGui::CollapsingHeader("Visualization", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::Indent();
+
+		bool viz_enabled = training_viz != nullptr;
+		if (ImGui::Checkbox("Enabled", &viz_enabled))
+			set_visualization_enabled(viz_enabled);
+		ImGui::SetItemTooltip("Disabling frees all GPU resources used by the visualization");
+
+		if (training_viz)
+			training_viz->draw_gui();
+
+		ImGui::Unindent();
+	}
+
+	if (ImGui::CollapsingHeader("Image Picker")) {
+		ImGui::Indent();
+		draw_image_gui();
+		ImGui::Unindent();
 	}
 
 	ImGui::End();
 
-	if (!points_gpu.is_valid())
-		return status;
+	if (run_continuously && desired_its <= completed_its) {
+		++desired_its;
+		desired_its.notify_one();
+	}
+
+	if (params.eps_slider != covq_params.eps) {
+		std::unique_lock<std::mutex> lock(sync);
+		covq_params.eps = params.eps_slider;
+		P = transition_matrix(covq_params);
+	}
+
+	if (training_viz)
+		training_viz->update(*trainer);
 
 	pc.flags = 
 		USE_HASH_COLORS_BIT * params.use_quantized;
 
-	render_points();
 	render_image();
 
 	return status;
-}
-
-int COVQTrainingApp::init_gpu_resources_for_training(const COVQParams &covq)
-{
-	if (codepoints_gpu.is_valid())
-		ev2::destroy_buffer(ctx, codepoints_gpu);
-
-	size_t codepoints_size = P.cols() * sizeof(uint32_t);
-	codepoints_gpu = ev2::create_buffer(ctx, codepoints_size,
-		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-	gpu_buffer_zero(codepoints_gpu, codepoints_size);
-	pc.codepoints = ev2::get_buffer_device_address(ctx, codepoints_gpu);
-
-	return 0;
-}
-
-int COVQTrainingApp::init_gpu_resources_for_data(const Eigen::MatrixXd &data)
-{
-	Eigen::Index dim = data.rows();
-	Eigen::Index count = data.cols();
-
-	assert(dim == 3);
-
-	size_t points_size = count * sizeof(uint32_t);
-
-	if (points_gpu.is_valid())
-		ev2::destroy_buffer(ctx, points_gpu);
-	points_gpu = ev2::create_buffer(ctx, points_size,
-		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-	if (mapping_gpu.is_valid())
-		ev2::destroy_buffer(ctx, mapping_gpu);
-	mapping_gpu = ev2::create_buffer(ctx, points_size,
-		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-	ev2::UploadContext uc = ev2::begin_upload(ctx, points_size, alignof(uint32_t));
-	eigen_to_rgba8(data, reinterpret_cast<uint32_t*>(uc.ptr));
-	ev2::BufferUpload up = {
-		.size = points_size,
-	};
-	ev2::commit_buffer_uploads(ctx, uc, points_gpu, &up, 1);
-	ev2::flush_uploads(ctx);
-
-	gpu_buffer_zero(mapping_gpu, points_size);
-
-	num_points = count;
-
-	pc.count = count;
-	pc.points = ev2::get_buffer_device_address(ctx, points_gpu);
-	pc.mapping = ev2::get_buffer_device_address(ctx, mapping_gpu);
-
-	return 0;
 }
 
 static inline int add_project_mounts(ev2::GfxContext *ctx)

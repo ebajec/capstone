@@ -8,6 +8,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <functional>
 
 #define TIMER_BEGIN(name)\
 std::atomic_thread_fence(std::memory_order_acquire);\
@@ -17,14 +18,6 @@ std::chrono::time_point name##_timer_start = std::chrono::high_resolution_clock:
 std::atomic_thread_fence(std::memory_order_release);\
 std::chrono::time_point name##_timer_end = std::chrono::high_resolution_clock::now();\
 printf("%s: %4f ms\n", #name, double((name##_timer_end - name##_timer_start).count()) / 1e6); 
-
-struct COVQTrainingDump
-{
-	std::mutex sync;
-	std::atomic_uint32_t generation = 0;
-	std::vector<uint32_t> codewords;
-	Eigen::MatrixXd codepoints;
-};
 
 struct COVQTrainingContext
 {
@@ -49,6 +42,9 @@ struct COVQTrainingContext
 	Eigen::MatrixXd centroids;
 
 	std::vector<uint32_t> mapping;
+
+	std::atomic_uint64_t epoch;
+	std::mutex mutex;
 };
 
 struct COVQEncoder
@@ -80,6 +76,7 @@ struct COVQCodec
 	COVQEncoder encoder;
 };
 
+// @brief map an input vector to an index to send over the channel
 static constexpr uint32_t covq_encode(const COVQCodec *codec, const double *in)
 {
 	const int partitions = codec->encoder.E.cols();
@@ -106,6 +103,12 @@ static constexpr uint32_t covq_encode(const COVQCodec *codec, const double *in)
 	return codec->encoder.index_map[argmin];
 }
 
+static constexpr uint32_t covq_index_mapping(const COVQTrainingContext &ctx, uint32_t i)
+{
+	return ctx.output_index_mapping ? ctx.output_index_mapping(i, ctx.word_length) : i;
+}
+
+// @brief map a channel output to a reconstruction vector.
 static constexpr void covq_decode(const COVQCodec *codec, uint32_t in, double *out)
 {
 	const double *src = codec->codebook.col(in).data(); 
@@ -119,8 +122,7 @@ extern COVQTrainingContext *covq_init(
 
 extern void covq_training_it(
 	COVQTrainingContext &ctx,
-	const Eigen::MatrixXd &X,
-	COVQTrainingDump *dump = nullptr
+	const Eigen::MatrixXd &X
 );
 
 extern COVQCodec *covq_create_codec(const COVQTrainingContext &ctx);

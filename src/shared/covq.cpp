@@ -100,8 +100,6 @@ COVQTrainingContext *covq_init(
 	const Eigen::MatrixXd &P
 )
 {
-	COVQTrainingContext *ctx = new COVQTrainingContext{};
-
 	uint32_t count = X.cols();
 	uint32_t dim = X.rows();
 	uint32_t M = P.rows();
@@ -109,7 +107,8 @@ COVQTrainingContext *covq_init(
 
 	uint32_t numthread = omp_get_num_threads();
 
-	*ctx = COVQTrainingContext{
+	// constructed in place, since the mutex/atomic members make it non-copyable
+	COVQTrainingContext *ctx = new COVQTrainingContext{
 		.count = count,
 		.dim = dim,
 		.N = N,
@@ -145,19 +144,14 @@ COVQTrainingContext *covq_init(
 	return ctx;
 }
 
-static uint32_t covq_index_mapping(const COVQTrainingContext &ctx, uint32_t i)
-{
-	return ctx.output_index_mapping ? ctx.output_index_mapping(i, ctx.word_length) : i;
-}
-
 // @param X - (dim , count) input dataset
 // @param P - (N , N) channel transition probabilities; P(i, j) = p(j|i)
 void covq_training_it(
 	COVQTrainingContext &ctx,
-	const Eigen::MatrixXd &X,
-	COVQTrainingDump *dump
+	const Eigen::MatrixXd &X
 )
 {
+	std::unique_lock<std::mutex> lock(ctx.mutex);
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 1
 
@@ -213,25 +207,10 @@ void covq_training_it(
 	ctx.probs *= p_x;
 	ctx.centroids *= p_x;
 
+	++ctx.epoch;
+
 	TIMER_END(TrainingIteration);
 
-	if (dump) {
-		std::unique_lock<std::mutex> lock(dump->sync);
-		TIMER_BEGIN(TrainingDump);
-
-		dump->codewords.clear();
-		dump->codewords.reserve(ctx.mapping.size());
-
-		uint32_t k = std::bit_width(ctx.M) - 1;
-
-		for (uint32_t idx : ctx.mapping) {
-			uint32_t codeword = covq_index_mapping(ctx, idx);
-			dump->codewords.push_back(codeword);
-		}
-		dump->codepoints = ctx.Y;
-		++dump->generation;
-		TIMER_END(TrainingDump);
-	}
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 0
 }

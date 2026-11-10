@@ -4,6 +4,21 @@
 #include "core/shader/core.glsl"
 #include "cap/shader/covq.glsl"
 
+const uint USE_HASH_COLORS_BIT = 0x1;
+
+layout (push_constant) uniform PC {
+	Points points;
+	Mapping mapping;
+	Centroids centroids;
+	uint count;
+	float w;
+	int stride;
+	uint flags;
+	uint image_start;
+	uint image_end;
+	ivec2 size;
+} pc;
+
 layout (set = EV2_BASE_USER_SET, binding = 0) uniform sampler2D u_tex;
 
 layout (location = 0) in vec2 in_pos;
