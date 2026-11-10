@@ -236,25 +236,7 @@ void covq_training_it(
 #define EIGEN_USE_AVX512_GEMM_KERNELS 0
 }
 
-COVQCodec *covq_create_codec(const COVQTrainingContext &ctx)
-{
-	COVQCodec *codec = new COVQCodec{COVQCodec{
-		.dim = ctx.dim,
-		.N = ctx.N,
-		.M = ctx.M,
-		.word_length = ctx.word_length,
-
-		.codebook = ctx.Y,
-		.centroids = ctx.centroids,
-		.probs = ctx.probs,
-
-		.P = ctx.P
-	}};
-
-	return codec;
-}
-
-struct COVQEncoder *covq_create_encoder(const COVQCodec *codec)
+static void covq_init_encoder(COVQCodec *codec)
 {
 	uint32_t nb_nonzero = 0;
 	for (uint32_t i = 0; i < codec->M; ++i) {
@@ -278,13 +260,28 @@ struct COVQEncoder *covq_create_encoder(const COVQCodec *codec)
 		}
 	}
 
-	return new COVQEncoder {
-		.dim = codec->dim,
-		.word_length = codec->word_length,
-		.E = std::move(E_out),
-		.v = std::move(v_out),
-		.index_map = std::move(index_map)
-	};
+	codec->encoder.E = std::move(E_out);
+	codec->encoder.v = std::move(v_out);
+	codec->encoder.index_map = std::move(index_map);
+}
+
+COVQCodec *covq_create_codec(const COVQTrainingContext &ctx)
+{
+	COVQCodec *codec = new COVQCodec{COVQCodec{
+		.dim = ctx.dim,
+		.N = ctx.N,
+		.M = ctx.M,
+		.word_length = ctx.word_length,
+
+		.codebook = ctx.Y,
+		.centroids = ctx.centroids,
+		.probs = ctx.probs,
+
+		.P = ctx.P
+	}};
+
+	covq_init_encoder(codec);
+	return codec;
 }
 
 size_t covq_serialized_size(const COVQCodec &codec)

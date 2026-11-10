@@ -4,6 +4,7 @@
 #include <Eigen/Dense>
 
 #include <cstdint>
+#include <cfloat>
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -52,14 +53,11 @@ struct COVQTrainingContext
 
 struct COVQEncoder
 {
-	// Sizes
-	uint32_t dim;
-	uint32_t word_length;
-
 	// For mapping inputs to sent indices, but only for
 	// partitions with nonzero probability
-	Eigen::MatrixXd E;
-	Eigen::VectorXd v;
+	
+	Eigen::MatrixXd E; // (dim x M)
+	Eigen::VectorXd v; // (M x 1)
 
 	// Maps indices of E and v to an index to send over the channel
 	std::vector<uint32_t> index_map; 
@@ -78,7 +76,41 @@ struct COVQCodec
 
 	// channel matrix
 	Eigen::MatrixXd P;
+
+	COVQEncoder encoder;
 };
+
+static constexpr uint32_t covq_encode(const COVQCodec *codec, const double *in)
+{
+	const int partitions = codec->encoder.E.cols();
+	const int dim = codec->dim;
+
+	const Eigen::MatrixXd &E = codec->encoder.E;
+	const Eigen::VectorXd &v = codec->encoder.v;
+
+	uint32_t argmin = 0;
+	double d_min = DBL_MAX;
+
+	for (uint32_t i = 0; i < partitions; ++i) {
+		double Ex_i = 0.0;
+		for (uint32_t j = 0; j < dim; ++j)
+			Ex_i += E(j, i) * in[j];
+		double d = v(i) - 2.0 * Ex_i;
+
+		if (d < d_min) {
+			argmin = i;
+			d_min = d;
+		}
+	}
+
+	return codec->encoder.index_map[argmin];
+}
+
+static constexpr void covq_decode(const COVQCodec *codec, uint32_t in, double *out)
+{
+	const double *src = codec->codebook.col(in).data(); 
+	std::copy(src, src + codec->dim, out);
+}
 
 extern COVQTrainingContext *covq_init(
 	const Eigen::MatrixXd& X,
@@ -92,7 +124,6 @@ extern void covq_training_it(
 );
 
 extern COVQCodec *covq_create_codec(const COVQTrainingContext &ctx);
-extern struct COVQEncoder *covq_create_encoder(const COVQCodec *codec);
 
 extern size_t covq_serialized_size(const COVQCodec &codec);
 extern int covq_serialize(const COVQCodec &codec, void *buf);

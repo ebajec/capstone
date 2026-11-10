@@ -46,5 +46,28 @@ struct BitTables {
 	};
 };
 
+// @return offset + nbits
+static constexpr size_t write_bits(
+	uint32_t word, int nbits, uint8_t *bytes, size_t offset)
+{
+	for (uint32_t j = 0; j < nbits; ++j) {
+		bytes[offset >> 3] |= ((word >> j) & 0x1) << (offset & 0x7);
+		++offset;
+	}
+	return offset;
+}
+
+// @return offset + nbits
+static constexpr size_t read_bits(
+	uint32_t& word, int nbits, const uint8_t *bytes, size_t offset)
+{
+	for (uint32_t j = 0; j < nbits; ++j) {
+		word |= uint32_t((bytes[offset >> 3] >> (offset & 0x7)) & 0x1) << j;
+		++offset;
+	}
+	return offset;
+}
+
+
 
 #endif

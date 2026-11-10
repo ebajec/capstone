@@ -49,10 +49,7 @@ size_t UniformQuantizer::encode(
 			std::clamp(lroundf(in_values[k] * scales[k]), -N, N - 1) + N
 		);
 
-		for (uint32_t j = 0; j < n_bits; ++j) {
-			out_bytes[idx >> 3] |= ((word >> j) & 0x1) << (idx & 0x7);
-			++idx;
-		}
+		idx = write_bits(word, n_bits, out_bytes, idx);
 	}
 
 	return idx - start_bit;
@@ -74,14 +71,9 @@ size_t UniformQuantizer::decode(
 		}
 
 		uint32_t word = 0;
+		idx = read_bits(word, n_bits, in_bytes, idx);
 
 		long N = (1 << (n_bits - 1));
-
-		for (uint32_t j = 0; j < n_bits; ++j) {
-			word |= uint32_t((in_bytes[idx >> 3] >> (idx & 0x7)) & 0x1) << j;
-			++idx;
-		}
-
 		out_values[k] = static_cast<float>((long)word - N) / scales[k];
 	}
 
