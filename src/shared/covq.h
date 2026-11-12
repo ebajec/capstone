@@ -41,6 +41,9 @@ struct COVQTrainingContext
 	Eigen::MatrixXd probs;
 	Eigen::MatrixXd centroids;
 
+	// number of reconstruction vectors with positive probability
+	uint32_t num_possible_codepoints;
+
 	std::vector<uint32_t> mapping;
 
 	std::atomic_uint64_t epoch;

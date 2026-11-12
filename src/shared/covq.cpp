@@ -2,65 +2,77 @@
 
 #include <cassert>
 
-#define ZERO_PROB_THRESHOLD 1e-9
+#define ZERO_PROB_THRESHOLD 1e-14
 
 static void split_heuristic_rec(
 	Eigen::Ref<Eigen::MatrixXd> X,
 	Eigen::Ref<Eigen::MatrixXd> out,
-	unsigned its, unsigned K, unsigned *idx, int depth)
+	unsigned K, unsigned *idx, int depth)
 {
 	Eigen::Index n = X.cols();
 
-	if (n < 2 || depth == 0)
+	if (!n)
 		return;
 
     Eigen::VectorXd mu = X.rowwise().mean();
 
-	unsigned dst = (*idx)++;
-	if (dst >= K) {
-		printf("Done\n");
+	const uint32_t leaf_depth = std::bit_width(K) - 1;
+
+	if (depth == leaf_depth) {
+		unsigned dst = (*idx)++;
+		if (dst >= K) {
+			printf("Done\n");
+			return;
+		}
+		out.col(dst) = mu;
 		return;
 	}
-	out.col(dst) = mu;
 
     Eigen::MatrixXd Xc = X.colwise() - mu;
-    Eigen::VectorXd mu_test = Xc.rowwise().minCoeff();
-    Eigen::VectorXd u = Eigen::VectorXd::Random(X.rows()).normalized();
 
 	Eigen::MatrixXd A = Xc * Xc.transpose();
-
-    for (int t = 0; t < its; ++t) {
-        Eigen::VectorXd w = A * u;
-        u = w.normalized();
-    }
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(A);
+    Eigen::VectorXd u = es.eigenvectors().col(X.rows() - 1);   // largest eigenvalue
+	
+	// canonicalize u so that largest compoenent is always positive
+	Eigen::Index k;
+    u.cwiseAbs().maxCoeff(&k);
+    if (u(k) < 0)
+		u = -u;
 
 	if (!n) {
 		fprintf(stderr, "X is empty!\n");
 		return;
 	}
 
+	Eigen::VectorXd proj = Xc.transpose() * u;
+	Xc.resize(0,0);
+
 	Eigen::Index i = 0;
 	Eigen::Index j = n - 1;
 
 	while (i <= j) {
-		double prod = Xc.col(i).dot(u);
-
-		if (prod < 0) {
+		if (proj(i) < 0) {
 			++i;
 		} else {
-			Xc.col(i).swap(Xc.col(j));
+			X.col(i).swap(X.col(j));
+			std::swap(proj(i), proj(j));
 			--j;
 		}
 	}
 
-	// don't need this anymore
-	Xc.resize(0,0);
+	if (i == 0 || i == n) {
+        const unsigned leaves = 1u << (leaf_depth - depth);
+        for (unsigned l = 0; l < leaves && *idx < K; ++l)
+                out.col((*idx)++) = mu;
+        return;
+	}
 
-	if (i == 0 || i == n)
-		return;
+	Eigen::Ref<Eigen::MatrixXd> left = X.leftCols(i);
+	Eigen::Ref<Eigen::MatrixXd> right = X.rightCols(n - i);
 
-	split_heuristic_rec(X.leftCols(i), out, its, K, idx, depth - 1);
-	split_heuristic_rec(X.rightCols(n - i), out, its, K, idx, depth - 1);
+	split_heuristic_rec(left, out, K, idx, depth + 1);
+	split_heuristic_rec(right, out, K, idx, depth + 1);
 }
 
 static Eigen::MatrixXd split_heuristic_internal(Eigen::MatrixXd &X, unsigned K)
@@ -68,10 +80,10 @@ static Eigen::MatrixXd split_heuristic_internal(Eigen::MatrixXd &X, unsigned K)
 	int dims = X.rows();
 	Eigen::MatrixXd out = Eigen::MatrixXd(dims, K); 
 
-	int depth = std::bit_width(K);
+	int depth = 0;
 
 	unsigned idx = 0;
-	split_heuristic_rec(X, out, 20, K, &idx, depth);
+	split_heuristic_rec(X, out, K, &idx, depth);
 
 	return out;
 }
@@ -123,17 +135,20 @@ COVQTrainingContext *covq_init(
 		.probs = Eigen::MatrixXd::Zero(1, M),
 
 		// dims * M
-		.centroids = split_heuristic(X, M),
+		.centroids = Eigen::MatrixXd::Zero(dim, M),
 
 		.mapping = std::vector<uint32_t>(count, 0),
 	};
 
+	Eigen::MatrixXd init = split_heuristic(X, M); 
+
 	Eigen::VectorXd d = Eigen::VectorXd::Zero(M);
 	for (Eigen::Index idx = 0; idx < X.cols(); ++idx) {
-		d.noalias() = (ctx->centroids.colwise() - X.col(idx)).colwise().squaredNorm(); 
+		d.noalias() = (init.colwise() - X.col(idx)).colwise().squaredNorm(); 
 		uint32_t argmin = 0;
 		d.minCoeff(&argmin);
 		ctx->probs(0, argmin) += 1;
+		ctx->centroids.col(argmin) += X.col(idx);
 	}
 
 	const double p_x = 1.0/(double)X.cols();
@@ -160,6 +175,8 @@ void covq_training_it(
 	ctx.Y.setZero();
 	ctx.Y.noalias() = ctx.centroids * ctx.P;
 
+	uint32_t num_nonzero_prob = 0;
+
 	for (uint32_t j = 0; j < ctx.N; ++j) {
 		double prob_j = (ctx.probs * ctx.P.col(j))(0,0);
 
@@ -168,29 +185,40 @@ void covq_training_it(
 			ctx.Y.col(j).setZero();
 		} else {
 			ctx.Y.col(j) /= prob_j;
+			++num_nonzero_prob;
 		}
 	}
+
+	ctx.num_possible_codepoints = num_nonzero_prob;
 
 	ctx.E.noalias() = ctx.Y * ctx.P.transpose();
 	ctx.v.noalias() = ctx.P * ctx.Y.colwise().squaredNorm().transpose();
 
+
 	TIMER_BEGIN(Centroids);
-	#pragma omp parallel
+	double d_sum = 0;
+	#pragma omp parallel reduction(+:d_sum)
 	{
 		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(ctx.M);
+
+		double d_expected_tls = 0;
 
 		#pragma omp for schedule(dynamic)
 		for (uint32_t c = 0; c < ctx.count; ++c) {
 			uint32_t argmin = 0;
 
 			d_tls.noalias() = ctx.v - 2.0 * (ctx.E.transpose() * X.col(c));
-			d_tls.minCoeff(&argmin);
-
+			double d = d_tls.minCoeff(&argmin);
 			uint32_t idx = argmin;
+
+			d_sum += d + X.col(c).squaredNorm();
 			ctx.mapping[c] = idx;
 		}
 	}
 	TIMER_END(Centroids);
+	double d_expected = d_sum / (double)ctx.count;
+
+	printf("Expected distortion: %.6f\n", d_expected);
 
 	// accumulate partition centroids
 	ctx.centroids.setZero();
