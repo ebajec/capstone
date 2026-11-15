@@ -1,6 +1,8 @@
 #ifndef COVQ_H
 #define COVQ_H
 
+#include "codec.h"
+
 #include <Eigen/Dense>
 
 #include <cstdint>
@@ -43,11 +45,11 @@ struct COVQTrainingContext
 
 	// number of reconstruction vectors with positive probability
 	uint32_t num_possible_codepoints;
+	double expected_distortion = 0;
 
 	std::vector<uint32_t> mapping;
 
 	std::atomic_uint64_t epoch;
-	std::mutex mutex;
 };
 
 struct COVQEncoder
@@ -77,6 +79,23 @@ struct COVQCodec
 	Eigen::MatrixXd P;
 
 	COVQEncoder encoder;
+};
+
+
+// Fixed length image compression interface
+struct COVQDCTCodec : IBlockImageCodec
+{
+	std::unique_ptr<COVQCodec> quantizers[64];
+
+	COVQDCTCodec(Eigen::MatrixXd P[64]);
+
+	// @return compressed size (in bytes) of an image with the specified dimensions
+	virtual size_t get_compressed_size(uint32_t w, uint32_t h, uint32_t ch) const override;
+
+	virtual void encode(uint32_t w, uint32_t h, uint32_t ch,
+					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
+	virtual void decode(uint32_t w, uint32_t h, uint32_t ch,
+					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
 };
 
 // @brief map an input vector to an index to send over the channel
@@ -136,6 +155,5 @@ extern int covq_deserialize(COVQCodec *codec, const void *buf);
 
 extern int covq_save(const COVQCodec *codec, const char *path);
 extern int covq_load(COVQCodec *codec, const char *path);
-
 
 #endif // COVQ_H

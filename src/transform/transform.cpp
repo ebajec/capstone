@@ -12,100 +12,13 @@
 #include <ev2/core.h>
 
 #include "stb_image.h"
-
-#include "dct8.hpp"
-
-#include "uniform_quantizer.h"
+#include "codec.h"
 
 struct Image
 {
 	int w, h, ch;
 	std::unique_ptr<uint8_t[]> bytes;
 };
-
-struct CompressedImage
-{
-	uint32_t w, h;
-	std::unique_ptr<uint8_t[]> bytes;
-};
-
-static void compress_image(
-	const IBlockCodec &codec,
-	const Image &in,
-	CompressedImage &out)
-{
-	const uint32_t w = in.w;
-	const uint32_t h = in.h;
-
-	const uint8_t *in_bytes = in.bytes.get();
-
-	const uint32_t total_blks = ((w + 7) >> 3) * ((h + 7) >> 3); 
-	const size_t total_bytes = 
-		(codec.bits_per_block() * (size_t)total_blks + 7)/8;
-
-	float coeffs[64];
-
-	uint8_t * out_bytes = new uint8_t[total_bytes] {};
-
-	uint8_t blk[64];
-
-	size_t bit_idx = 0;
-	for (uint32_t by = 0; by < h; by += 8) {
-		for (uint32_t bx = 0; bx < w; bx += 8) {
-
-			for (uint32_t y = 0; y < 8; ++y) {
-				const uint32_t sy = std::min(by + y, h - 1);
-				for (uint32_t x = 0; x < 8; ++x) {
-					const uint32_t sx = std::min(bx + x, w - 1);
-					blk[y * 8 + x] = in_bytes[w * sy + sx];
-				}
-			}
-			dct8::forward_u8(blk, 8, coeffs);
-
-			bit_idx += codec.encode(coeffs, out_bytes, bit_idx);
-		}
-	}
-	
-	out.bytes.reset(out_bytes);
-	out.w = w;
-	out.h = h;
-}
-
-static void uncompress_image(
-	const IBlockCodec &codec,
-	const CompressedImage &in,
-	Image &out)
-{
-	const uint32_t w = in.w;
-	const uint32_t h = in.h;
-
-	const uint8_t *in_bytes = in.bytes.get();
-
-	uint8_t * out_bytes = new uint8_t[w * h];
-
-	float coeffs[64];
-	uint8_t blk[64];
-
-	size_t bit_idx = 0;
-	for (uint32_t by = 0; by < h; by += 8) {
-		for (uint32_t bx = 0; bx < w; bx += 8) {
-			bit_idx += codec.decode(in_bytes, bit_idx, coeffs);
-
-			dct8::inverse_u8(coeffs, blk, 8);
-
-			// Crop the padding
-			const uint32_t bw = std::min(8u, w - bx);
-			const uint32_t bh = std::min(8u, h - by);
-			for (uint32_t y = 0; y < bh; ++y)
-				memcpy(out_bytes + w * (by + y) + bx, blk + y * 8, bw);
-		}
-	}
-
-	out.w = w;
-	out.h = h;
-	out.bytes.reset(out_bytes);
-	out.ch = STBI_grey;
-}
 
 // RGB -> YCbCr, full-range BT.601 (JPEG/JFIF). Cb and Cr are offset by 128.
 static void rgb8_to_ycbcr(const uint8_t rgb[3], uint8_t ycbcr[3])
@@ -139,10 +52,10 @@ struct App
 
 	std::unique_ptr<ev2::Viewport> grid_viewport;
 
-	CompressedImage comp_bits;
 	Image orig_img;
 	Image decomp_img;
-	
+
+	int sel_grid = 0;
 	uint8_t bit_grid[8][8] {};
 
 	bool prev_left = false;
@@ -172,11 +85,15 @@ struct App
 
 	void recompress_image()
 	{
-		std::unique_ptr<UniformQuantizer> codec = std::make_unique<UniformQuantizer>(
-			&bit_grid[0][0], 128.f); 
-		compress_image(*codec, orig_img, comp_bits);
-		uncompress_image(*codec, comp_bits, decomp_img);
 		
+		DCTImageCodec codec = DCTImageCodec::make<UniformDCTQuantizer>(&bit_grid[0][0]);
+
+		size_t nb_comp_bytes = codec.get_compressed_size(orig_img.w, orig_img.h, orig_img.ch);
+		std::unique_ptr<uint8_t[]> comp_bytes (new uint8_t[nb_comp_bytes]);
+
+		codec.encode(orig_img.w, orig_img.h, orig_img.ch, orig_img.bytes.get(), comp_bytes.get());
+		codec.decode(orig_img.w, orig_img.h, orig_img.ch, comp_bytes.get(), decomp_img.bytes.get());
+
 		size_t nbytes = orig_img.w * orig_img.h * orig_img.ch;
 
 		ev2::UploadContext uc = ev2::begin_upload(ctx, nbytes, alignof(uint32_t));
@@ -200,11 +117,39 @@ struct App
 			ev2::editor::close_image_viewer(decomp_viewer);
 			ev2::destroy_image(ctx, rd.decomp);
 		}
+
+		decomp_img = Image {
+			.w = img.w,
+			.h = img.h,
+			.ch = img.ch,
+			.bytes = std::make_unique<uint8_t[]>(img.w * img.h * img.ch),
+		};
+
+		const char *pipeline_path = nullptr;
+		ev2::ImageFormat fmt;
+		switch (img.ch) {
+			case STBI_grey:
+				fmt = ev2::IMAGE_FORMAT_R8_UNORM;
+				pipeline_path = "core://pipeline/grayscale.yaml";
+				break;
+			case STBI_grey_alpha:
+				abort();
+				break;
+			case STBI_rgb:
+				abort();
+				break;
+			case STBI_rgb_alpha:
+				fmt = ev2::IMAGE_FORMAT_RGBA8;
+				pipeline_path = "core://pipeline/screen_quad.yaml";
+				break;
+			default:
+				abort();
+		}
 		
 		rd.orig = ev2::create_image(ctx, img.w, img.h, 1,
-			ev2::IMAGE_FORMAT_R8_UNORM, ev2::IMAGE_USAGE_SAMPLED_BIT);
+			fmt, ev2::IMAGE_USAGE_SAMPLED_BIT);
 		rd.decomp = ev2::create_image(ctx, img.w, img.h, 1,
-			ev2::IMAGE_FORMAT_R8_UNORM, ev2::IMAGE_USAGE_SAMPLED_BIT);
+			fmt, ev2::IMAGE_USAGE_SAMPLED_BIT);
 
 		size_t nbytes = img.w * img.h * img.ch;
 
@@ -220,13 +165,37 @@ struct App
 
 		ev2::flush_uploads(ctx);
 
-		orig_viewer = ev2::editor::open_image_viewer(rd.orig, "Original Image", "core://pipeline/grayscale.yaml");
-		decomp_viewer = ev2::editor::open_image_viewer(rd.decomp, "Decompressed Image", "core://pipeline/grayscale.yaml");
+		orig_viewer = ev2::editor::open_image_viewer(rd.orig, "Original Image", pipeline_path);
+		decomp_viewer = ev2::editor::open_image_viewer(rd.decomp, "Decompressed Image", pipeline_path);
 
 		return 0;
 	}
 
-	int update() {
+	int update()
+	{
+		ImGui::Begin("Editor");
+		if (ImGui::Combo("Quality", &sel_grid, "DC\0Full\0""0.25 bpp\0""0.5 bpp\0""1 bpp\0""2 bpp\0""4 bpp")) {
+			switch(sel_grid) {
+				case 0:
+					memcpy(bit_grid, BitTables::dc_only, 64); break;
+				case 1:
+					memcpy(bit_grid, BitTables::full, 64); break;
+				case 2:
+					memcpy(bit_grid, BitTables::bpp_0_25, 64); break;
+				case 3:
+					memcpy(bit_grid, BitTables::bpp_0_5, 64); break;
+				case 4:
+					memcpy(bit_grid, BitTables::bpp_1, 64); break;
+				case 5:
+					memcpy(bit_grid, BitTables::bpp_2, 64); break;
+				case 6:
+					memcpy(bit_grid, BitTables::bpp_4, 64); break;
+			}
+			update_grid();
+			recompress_image();
+		}
+		ImGui::End();
+
 		grid_viewport->update(nullptr);
 
 		glm::dvec2 scale = glm::dvec2(grid_viewport->get_size()); 
@@ -248,7 +217,7 @@ struct App
 			pos == grid_pos && grid_viewport->is_hovered()) {
 			uint8_t &bits = bit_grid[grid_pos.y][grid_pos.x];
 			bool updated = false;
-			if (left_clicked && bits < UniformQuantizer::max_bits) {
+			if (left_clicked && bits < UniformDCTQuantizer::max_bits) {
 				bits = std::clamp(bits + 1, 0, 8);
 				updated = true;
 			} else if (right_clicked && bits > 0) {
@@ -321,9 +290,15 @@ int main(int argc, char *argv[])
 	Image image {};
 	for (int i = 1; i < argc; ++i) {
 		if (true) {
-			int desired_ch = STBI_grey;
+			int desired_ch = STBI_rgb_alpha;
 			int ch;
 			stbi_uc *bytes = stbi_load(argv[i], &image.w, &image.h, &ch, desired_ch);
+
+			if (!bytes) {
+				printf("Failed to load image %s\n", argv[i]);
+				return EXIT_FAILURE;
+			}
+
 			size_t nbytes = image.w * image.h * desired_ch;
 			image.ch = desired_ch;
 			image.bytes.reset(new uint8_t[nbytes]);

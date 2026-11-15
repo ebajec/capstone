@@ -166,9 +166,10 @@ void covq_training_it(
 	const Eigen::MatrixXd &X
 )
 {
-	std::unique_lock<std::mutex> lock(ctx.mutex);
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 1
+
+	printf("------------------------------------------------\n");
 
 	TIMER_BEGIN(TrainingIteration);
 
@@ -219,6 +220,8 @@ void covq_training_it(
 	double d_expected = d_sum / (double)ctx.count;
 
 	printf("Expected distortion: %.6f\n", d_expected);
+
+	ctx.expected_distortion = d_expected;
 
 	// accumulate partition centroids
 	ctx.centroids.setZero();

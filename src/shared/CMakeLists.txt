@@ -2,7 +2,6 @@ add_library(shared STATIC
 	covq.cpp
 	stb_image.cpp
 	codec.cpp
-	uniform_quantizer.cpp
 )
 
 target_include_directories(shared
