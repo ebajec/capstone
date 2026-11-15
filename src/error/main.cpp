@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <random>
 #include <string_view>
 #include <vector>
 
@@ -303,26 +304,37 @@ int main(int argc, char** argv)
 
     HammingCode codec;
 
-    const BitBuffer input = BitBuffer{
-        .bytes = Bytes{0b1100101, 0b01101101},
-        .bit_count = 16,
-    }; 
-    
-    TIMER_BEGIN(HammingCode)
-    printf("Input bits: %s\n", input.toString().c_str());
+    constexpr size_t input_size = 1024 * 1024; // 1 MB example
+    BitBuffer input = BitBuffer{
+        .bytes = Bytes(input_size, 0),
+        .bit_count = input_size * 8,
+    };
 
+    std::mt19937 random(0);
+    for(auto& byte : input.bytes)
+        byte = uint8_t(random());
+
+    printf("Input: %zu bytes (%zu bits)\n", input.bytes.size(), input.bit_count);
+
+    TIMER_BEGIN(Encode)
     BitBuffer encoded = codec.encode(input);
-    printf("Encoded bits: %s\n", encoded.toString().c_str());
-        
-    // Here I'll just flip one of the encoded bits
-    encoded.bytes[0] ^= 0b010;
+    TIMER_END(Encode)
 
-    printf("Encoded bits (corrupted): %s\n", encoded.toString().c_str());
+    printf("Encoded: %zu bytes (%zu bits)\n", encoded.bytes.size(), encoded.bit_count);
 
+    // Here I'll flip one of the encoded bits for each byte
+    for(size_t i = 2; i < encoded.bit_count; i += 12)
+    {
+        encoded.bytes[i / 8] ^= uint8_t(1 << (i % 8));
+    }
+
+    TIMER_BEGIN(Decode)
     const BitBuffer decoded = codec.decode(encoded);
-    printf("Decoded bits: %s\n", decoded.toString().c_str());
-    TIMER_END(HammingCode)
+    TIMER_END(Decode)
 
-    return 0;
+    const bool matches = decoded.bit_count == input.bit_count && decoded.bytes == input.bytes;
+    printf("Decoded matches input: %s\n", matches ? "yes" : "no");
+
+    return matches ? 0 : 1;
 }
 
