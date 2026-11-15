@@ -1,7 +1,9 @@
 #include "codec.h"
+#include "covq.h"
 
+#include <algorithm>
 #include <cstdio>
-#include <filesystem>
+#include <string_view>
 #include <vector>
 
 using Bytes = std::vector<std::uint8_t>;
@@ -12,12 +14,14 @@ struct BitBuffer
     size_t bit_count = 0;
 
     std::string toString() const;
+    static std::vector<BitBuffer> chunkBitBuffer(const BitBuffer& in, size_t size);
 };
 
 std::string BitBuffer::toString() const
 {
     std::string result;
-    
+    result.reserve(bit_count);
+   
     for (size_t i = 0; i < bit_count; ++i)
     {
         uint32_t bit = 0;
@@ -28,8 +32,34 @@ std::string BitBuffer::toString() const
     return result;
 }
 
+std::vector<BitBuffer> BitBuffer::chunkBitBuffer(const BitBuffer& in, size_t size)
+{
+    std::vector<BitBuffer> out;
+
+    for(size_t i = 0; i < in.bit_count; i += size)
+    {
+        const size_t min_size = std::min(size, in.bit_count - i);
+
+        uint32_t word;
+        read_bits(word, min_size, in.bytes.data(), i);
+
+        BitBuffer component = BitBuffer{
+            .bytes = Bytes((size + 7) / 8, 0),
+            .bit_count = size,
+        };
+
+        write_bits(word, min_size, component.bytes.data(), 0);
+
+        out.emplace_back(std::move(component));
+    }
+
+    return out;
+}
+
 struct IErrorCorrectingCode
 {
+    virtual ~IErrorCorrectingCode() = default;
+
     virtual BitBuffer encode(const BitBuffer& in) const = 0;
     virtual BitBuffer decode(const BitBuffer& in) const = 0;
 };
@@ -50,11 +80,17 @@ struct RepetitionCode final : public IErrorCorrectingCode
 // Hamming code: https://en.wikipedia.org/wiki/Hamming_code
 // Needs data and parity bits satisfying: 2^p >= d + p + 1
 // Parity bits are placed in positions which are powers of 2 (i.e. 1, 2, 4, 8, etc.)
-//
 struct HammingCode final : public IErrorCorrectingCode
 {
     BitBuffer encode(const BitBuffer& in) const override;
     BitBuffer decode(const BitBuffer& in) const override;
+
+private:
+    static constexpr size_t DataBits = 8; // d
+    static constexpr size_t EncodedBits = 12; // d + p
+
+    static uint32_t encodeBlock(uint32_t data);
+    static uint32_t decodeBlock(uint32_t encoded);
 };
 
 BitBuffer RepetitionCode::encode(const BitBuffer& in) const
@@ -88,7 +124,7 @@ BitBuffer RepetitionCode::decode(const BitBuffer& in) const
         uint32_t ones = 0;
         for (uint32_t j = 0; j < repetitions; ++j)
         {
-            uint32_t bit = 0;
+            uint32_t bit;
             input_offset = read_bits(bit, 1, in.bytes.data(), input_offset);
             ones += bit; // count number of ones
         }
@@ -104,29 +140,27 @@ BitBuffer RepetitionCode::decode(const BitBuffer& in) const
 
 BitBuffer HammingCode::encode(const BitBuffer& in) const
 {
+    // Shorten the final codeword to preserve the input bit count.
+    const size_t d = in.bit_count % DataBits;
+    size_t p = 0;
+    while((1 << p) < d + p + 1)
+        p++;
+
     BitBuffer out;
-    out.bytes.resize(in.bit_count, 0);
-    out.bit_count = in.bit_count;
+    out.bit_count = (in.bit_count / DataBits) * EncodedBits + d + p;
+    out.bytes.resize((out.bit_count + 7) / 8, 0);
 
-    // Satify the constraint: 2^p >= d + p + 1
-    Bytes p; // Determine parity bits
-
-    size_t input_offset = 0;
-    for(size_t i = 0; i < in.bit_count; ++i)
+    size_t output_offset = 0;
+    for(size_t i = 0; i < in.bit_count; i += DataBits)
     {
-        if(auto bit_location = i + 1; (bit_location & (bit_location - 1)) == 0) // Is power of two
-        {
-            out.bytes.push_back(0);
-            out.bit_count++;
+        const size_t min_size = std::min(DataBits, in.bit_count - i);
 
-            uint32_t bit = 0;
-            write_bits(bit, 1, p.data(), out.bit_count - in.bit_count);
-        }
-        else // Write bit as normal
-        {
-            uint32_t bit = 0;
-            input_offset = write_bits(bit, 1, out.bytes.data(), input_offset);
-        }
+        uint32_t data;
+        read_bits(data, min_size, in.bytes.data(), i);
+
+        const uint32_t encoded = encodeBlock(data); // Add redundancy
+        const size_t encoded_size = std::min(EncodedBits, out.bit_count - output_offset);
+        output_offset = write_bits(encoded, encoded_size, out.bytes.data(), output_offset);
     }
 
     return out;
@@ -134,44 +168,161 @@ BitBuffer HammingCode::encode(const BitBuffer& in) const
 
 BitBuffer HammingCode::decode(const BitBuffer& in) const
 {
+    // Count parity positions in the final shortened codeword.
+    const size_t n = in.bit_count % EncodedBits;
+    size_t p = 0;
+    while((1 << p) <= n)
+        p++;
+
+    BitBuffer out;
+    out.bit_count = (in.bit_count / EncodedBits) * DataBits + n - p;
+    out.bytes.resize((out.bit_count + 7) / 8, 0);
+
+    size_t output_offset = 0;
+    for(size_t i = 0; i < in.bit_count; i += EncodedBits)
+    {
+        const size_t min_size = std::min(EncodedBits, in.bit_count - i);
+
+        uint32_t encoded;
+        read_bits(encoded, min_size, in.bytes.data(), i);
+
+        const uint32_t data = decodeBlock(encoded); // Remove redundancy and correct errors
+        const size_t data_size = std::min(DataBits, out.bit_count - output_offset);
+        if(data_size != 0)
+            output_offset = write_bits(data, data_size, out.bytes.data(), output_offset);
+    }
+
+    return out;
+}
+
+uint32_t HammingCode::encodeBlock(uint32_t data)
+{
+    uint32_t out = 0;
+
+    size_t output_offset = 0;
+    for(size_t d_idx = 0; d_idx < DataBits; )
+    {
+        auto output_location = output_offset + 1;
+        if((output_location & (output_location - 1)) == 0) // Is power of two; skip parity bit
+        {
+            output_offset++;
+        }
+        else // Write bit as normal
+        {
+            const uint32_t bit = (data >> d_idx) & 1;
+            out |= bit << output_offset;
+            output_offset++;
+            d_idx++;
+        }
+    }
+
+    for(size_t parity_pos = 1; parity_pos <= EncodedBits; parity_pos <<= 1)
+    {
+        uint32_t parity_bit = 0;
+
+        for(size_t data_pos = 1; data_pos <= EncodedBits; ++data_pos)
+        {
+            if(parity_pos & data_pos) // Find all bits this parity bit accounts for
+            {
+                const uint32_t bit = (out >> (data_pos - 1)) & 1;
+                parity_bit ^= bit;
+            }
+        }
+        
+        // An odd number of ones needs the parity bit set.
+        if(parity_bit)
+        {
+            out |= 1 << (parity_pos - 1);
+        }
+    }
+
+    return out;
+}
+
+uint32_t HammingCode::decodeBlock(uint32_t encoded)
+{
+    // Check parity groups
+    size_t error_position = 0;
+    for(size_t parity_pos = 1; parity_pos <= EncodedBits; parity_pos <<= 1)
+    {
+        uint32_t parity_bit = 0;
+
+        for(size_t data_pos = 1; data_pos <= EncodedBits; ++data_pos)
+        {
+            if(data_pos & parity_pos)
+            {
+                const uint32_t bit = (encoded >> (data_pos - 1)) & 1;
+                parity_bit ^= bit;
+            }
+        }
+
+        if(parity_bit)
+        {
+            error_position |= parity_pos;
+        }
+    }
+
+    uint32_t out = 0;
+    size_t output_offset = 0;
+    for(size_t i = 0; i < EncodedBits; ++i )
+    {
+        const size_t pos = i + 1;
+        uint32_t bit = (encoded >> i) & 1;
+
+        if(pos == error_position)
+        {
+            bit ^= 1;
+        }
+
+        if((pos & (pos - 1)) != 0) // Prevent copying parity bits
+        {
+            out |= bit << output_offset;
+            output_offset++;
+        }
+    }
+
+    return out;
 }
 
 int main(int argc, char** argv)
 {
     struct Options
     {
-        bool useSTDIN;
-        enum class ECC { Repetition, Hamming };
+        bool useSTDIN = false;
     } options;
 
-    for(size_t i = 0; i < argc; ++i)
+    for(int i = 1; i < argc; ++i)
     {
-        if(argv[i] == "-i" || argv[i] == "--stdin")
+        const std::string_view& arg = argv[i];
+        if(arg == "-i" || arg == "--stdin")
         {
             options.useSTDIN = true;
             printf("Using stdin...\n");
         }
-
-        // if(argv[i] == "--ecc="
     }
 
-    RepetitionCode codec;
+    HammingCode codec;
 
-    const BitBuffer input{Bytes{0b00000101}, 3}; // The bit sequence 1, 0, 1.
+    const BitBuffer input = BitBuffer{
+        .bytes = Bytes{0b1100101, 0b01101101},
+        .bit_count = 16,
+    }; 
+    
+    TIMER_BEGIN(HammingCode)
     printf("Input bits: %s\n", input.toString().c_str());
 
-    BitBuffer encoded = codec.encode(input); // we should obtain 111000111
+    BitBuffer encoded = codec.encode(input);
     printf("Encoded bits: %s\n", encoded.toString().c_str());
-    
+        
     // Here I'll just flip one of the encoded bits
     encoded.bytes[0] ^= 0b010;
-    encoded.bytes[2] ^= 0b010;
-    encoded.bytes[4] ^= 0b010;
 
     printf("Encoded bits (corrupted): %s\n", encoded.toString().c_str());
 
     const BitBuffer decoded = codec.decode(encoded);
     printf("Decoded bits: %s\n", decoded.toString().c_str());
+    TIMER_END(HammingCode)
+
     return 0;
 }
 
