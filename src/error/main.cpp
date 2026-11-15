@@ -1,11 +1,7 @@
 #include "codec.h"
 #include "covq.h"
 
-#include <algorithm>
-#include <cstdio>
 #include <random>
-#include <string_view>
-#include <vector>
 
 using Bytes = std::vector<std::uint8_t>;
 
@@ -88,7 +84,7 @@ struct HammingCode final : public IErrorCorrectingCode
 
 private:
     static constexpr size_t DataBits = 8; // d
-    static constexpr size_t EncodedBits = 12; // d + p
+    static constexpr size_t EncodedBits = 12; // d + p + 1
 
     static uint32_t encodeBlock(uint32_t data);
     static uint32_t decodeBlock(uint32_t encoded);

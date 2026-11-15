@@ -6,16 +6,9 @@ add_executable(${TARGET})
 
 # --- Dependencies ---
 
-target_compile_definitions(${TARGET} PRIVATE -DPROJECT_MOUNT="cap")
-target_compile_definitions(${TARGET} PRIVATE -DRESOURCE_DIR="${PROJECT_SOURCE_DIR}/resource")
-
 target_link_libraries(${TARGET} PRIVATE
 	shared
-	ev2-editor
-	ev2-engine
 )
-
-ev2_add_mount(${TARGET} NAME cap DIR ${PROJECT_SOURCE_DIR}/resource)
 
 # --- Sources ----
 
