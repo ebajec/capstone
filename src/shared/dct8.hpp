@@ -16,10 +16,6 @@
 //   dct8::forward(blk, blk);     // spatial -> frequency
 //   dct8::inverse(blk, blk);     // frequency -> spatial
 //
-//   // 8-bit image helpers (level shift by 128, round + clamp on the way back)
-//   dct8::forward_u8(img + y*w + x, w, coeffs);
-//   dct8::inverse_u8(coeffs, img + y*w + x, w);
-//
 // Uses a fast butterfly factorization (see detail::fdct1d): 272 multiplies
 // per 2D block instead of 1024.
 
@@ -29,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <algorithm>
 #include <type_traits>
 
 namespace dct8 {
@@ -162,27 +159,16 @@ inline Block<T> inverse(const Block<T>& in) { Block<T> o; inverse(in.data(), o.d
 
 // ---- 8-bit image helpers ---------------------------------------------------
 
-// Reads an 8x8 tile from an 8-bit image (stride in bytes), subtracts 128,
-// and writes 64 coefficients.
-template <class T = float>
-inline void forward_u8(const std::uint8_t* src, std::ptrdiff_t stride, T* coeffs) {
-    T blk[64];
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x)
-			blk[y * 8 + x] = static_cast<T>(src[y * stride + x]) - T(128);
-    forward(blk, coeffs);
+template<class T = float>
+constexpr T unpack_u8(uint8_t x)
+{
+	return static_cast<T>(x) - T(128);
 }
 
-// Inverse-transforms 64 coefficients, adds 128, rounds, clamps to [0,255].
-template <class T = float>
-inline void inverse_u8(const T* coeffs, std::uint8_t* dst, std::ptrdiff_t stride) {
-    T blk[64];
-    inverse(coeffs, blk);
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x) {
-            long v = std::lround(blk[y * 8 + x] + T(128));
-            dst[y * stride + x] = static_cast<std::uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
-        }
+template<class T = float>
+constexpr uint8_t pack_u8(T x)
+{
+	return static_cast<uint8_t>(std::clamp(std::lround(x + T(128)), 0l, 255l));
 }
 
 // ---- Zigzag order ----------------------------------------------------------

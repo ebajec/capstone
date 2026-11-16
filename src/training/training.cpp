@@ -1,6 +1,7 @@
 #include "covq.h"
 #include "stb_image.h"
 #include "codec.h"
+#include "covq_image_codec.h"
 
 #include <ev2/editor.h>
 #include <ev2/viewport.h>
@@ -20,33 +21,7 @@
 #include <thread>
 #include <algorithm>
 
-struct Image
-{
-	static void c_deleter(void *p)
-	{
-		free(p);
-	}
-
-	static void null_deleter(void *p)
-	{
-	}
-
-	typedef void(*FreeFn)(void *);
-	typedef std::unique_ptr<uint8_t[], FreeFn> BytesPtr;
-
-	std::string path;
-	BytesPtr bytes {nullptr, &null_deleter};
-	uint32_t w;
-	uint32_t h;
-	uint32_t ch;
-
-	constexpr size_t nbytes() const {return w * h * ch;}
-};
-
-enum CompressionMode {
-	COMPRESSION_MODE_DCT,
-	COMPRESSION_MODE_RGB_VQ
-};
+#define USE_COVQ_DCT_CODEC
 
 // @param k - number of codeword bits
 Eigen::MatrixXd bsc_matrix(uint32_t k, double eps)
@@ -121,7 +96,6 @@ int load_image(const char *path, Image *out)
 
 	if (bytes) {
 		*out = Image{
-			.path = path,
 			.bytes = {bytes, &Image::c_deleter},
 			.w = (uint32_t)w,
 			.h = (uint32_t)h,
@@ -173,14 +147,18 @@ Eigen::MatrixXd images_to_matrix(std::span<const Image> images)
 	return X;
 }
 
-void eigen_to_rgba8(const Eigen::MatrixXd &data, uint32_t *out)
+// @brief pack (3, n) data into rgba8, mapping v -> v * scale + offset before
+// clamping to [0, 1]
+void eigen_to_rgba8(const Eigen::MatrixXd &data, uint32_t *out,
+	double scale = 1.0, double offset = 0.0)
 {
 	const std::decay_t<decltype(data)>::Scalar *p = data.data();
 	size_t base = 0;
 	for (size_t i = 0; i < data.size(); i += 3) {
 		uint32_t rgba = 0x0;
 		for (int j = 0; j < 3; ++j) {
-			uint32_t value = static_cast<uint32_t>(std::clamp(p[i + j] * 255.0, 0.0, 255.0));
+			const double v = p[i + j] * scale + offset;
+			uint32_t value = static_cast<uint32_t>(std::clamp(v * 255.0, 0.0, 255.0));
 			rgba |= value << (j << 3);
 		}
 		out[base++] = rgba;
@@ -267,6 +245,11 @@ struct COVQTrainingVisualization
 
 	ev2::GfxContext *gfx = nullptr;
 
+	// affine map from dataset values to the [0, 1] display cube:
+	// v_display = v * scale + offset. Applied to points and codepoints.
+	double scale = 1.0;
+	double offset = 0.0;
+
 	uint32_t num_points = 0;
 	uint32_t num_codepoints = 0;
 	uint32_t num_possible_codepoints = 0;
@@ -290,7 +273,9 @@ struct COVQTrainingVisualization
 	uint64_t synced_epoch = INVALID_EPOCH;
 
 	// @param data - (3, count) dataset the trainer is run on
-	static COVQTrainingVisualization *create(const Eigen::MatrixXd &data);
+	// @param scale, offset - display mapping, v -> v * scale + offset
+	static COVQTrainingVisualization *create(const Eigen::MatrixXd &data,
+		double scale = 1.0, double offset = 0.0);
 	~COVQTrainingVisualization();
 
 	ev2::BufferID get_codepoints_buffer() {return rd.codepoints;}
@@ -308,7 +293,8 @@ struct COVQTrainingVisualization
 	uint32_t num_drawn_points() const;
 };
 
-COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::MatrixXd &data)
+COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::MatrixXd &data,
+	double scale, double offset)
 {
 	assert(data.rows() == 3);
 
@@ -316,6 +302,8 @@ COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::Matrix
 
 	COVQTrainingVisualization *viz = new COVQTrainingVisualization{};
 	ev2::GfxContext *gfx = viz->gfx = ev2::editor::ctx();
+	viz->scale = scale;
+	viz->offset = offset;
 
 	viz->viewport.reset(new ev2::Viewport("Visualization", 0, 0, 500, 500,
 		ev2::RENDER_TARGET_CREATE_DEPTH_BIT | ev2::RENDER_TARGET_CREATE_COLOR_BIT));
@@ -333,7 +321,7 @@ COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::Matrix
 		ev2::BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
 	ev2::UploadContext uc = ev2::begin_upload(gfx, points_size, alignof(uint32_t));
-	eigen_to_rgba8(data, reinterpret_cast<uint32_t*>(uc.ptr));
+	eigen_to_rgba8(data, reinterpret_cast<uint32_t*>(uc.ptr), scale, offset);
 	ev2::BufferUpload up = {.size = points_size};
 	ev2::commit_buffer_uploads(gfx, uc, viz->rd.points, &up, 1);
 	ev2::flush_uploads(gfx);
@@ -413,7 +401,7 @@ void COVQTrainingVisualization::sync(COVQTrainingContext &trainer, std::mutex *m
 	// Y is empty until the first training iteration has run
 	if (trainer.Y.cols() == num_codepoints) {
 		assert(trainer.Y.rows() == 3);
-		eigen_to_rgba8(trainer.Y, reinterpret_cast<uint32_t*>(codepoints_uc.ptr));
+		eigen_to_rgba8(trainer.Y, reinterpret_cast<uint32_t*>(codepoints_uc.ptr), scale, offset);
 	} else {
 		memset(codepoints_uc.ptr, 0x0, codepoints_size);
 	}
@@ -519,80 +507,6 @@ void COVQTrainingVisualization::draw_gui()
 	ImGui::PopID();
 }
 
-
-struct COVQTestImageCodec : IBlockImageCodec
-{
-	// We'll only consider rgba in the most extreme case
-	static constexpr int MAX_CHANNELS = 4;
-
-	std::unique_ptr<COVQCodec> quantizer;
-
-	COVQTestImageCodec(COVQCodec *in_quantizer) : quantizer(in_quantizer) {
-	}
-
-	// @return compressed size (in bytes) of an image with the specified dimensions
-	virtual size_t get_compressed_size(uint32_t w, uint32_t h, uint32_t ch) const override;
-
-	virtual void encode(uint32_t w, uint32_t h, uint32_t ch,
-					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
-	virtual void decode(uint32_t w, uint32_t h, uint32_t ch,
-					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
-};
-
-// @return compressed size (in bytes) of an image with the specified dimensions
-size_t COVQTestImageCodec::get_compressed_size(uint32_t w, uint32_t h, uint32_t ch) const
-{
-	return w * h * ((quantizer->word_length + 7) >> 3);
-}
-
-void COVQTestImageCodec::encode(uint32_t w, uint32_t h, uint32_t ch,
-				 const uint8_t *in_bytes, uint8_t *out_bytes) const
-{
-	assert(ch >= quantizer->dim);
-
-	const int word_len = quantizer->word_length;
-
-	size_t bit_offset = 0;
-
-	double X[MAX_CHANNELS] {};
-	for (uint32_t i = 0; i < ch * w * h; i += ch) {
-		const uint8_t *pix = &in_bytes[i];
-
-		for (int j = 0; j < ch; ++j)
-			X[j] = (double)pix[j]/255.0;
-
-		uint32_t w = covq_encode(quantizer.get(), X);
-		bit_offset = write_bits(w, word_len, out_bytes, bit_offset);
-	}
-}
-void COVQTestImageCodec::decode(uint32_t w, uint32_t h, uint32_t ch,
-				 const uint8_t *in_bytes, uint8_t *out_bytes) const
-{
-	assert(ch >= quantizer->dim);
-
-	const int word_len = quantizer->word_length;
-
-	size_t bit_offset = 0;
-
-	// this is a hack for rgba8.
-	double Y[MAX_CHANNELS] {UINT8_MAX};
-
-	for (uint32_t i = 0; i < ch * w * h; i += ch) {
-		uint32_t w = 0;
-		bit_offset = read_bits(w, word_len, in_bytes, bit_offset);
-
-		covq_decode(quantizer.get(), w, Y);
-
-		uint8_t *pix = &out_bytes[i];
-
-		for (int j = 0; j < ch; ++j)
-			pix[j] = (uint8_t)(std::clamp(Y[j], 0.0, 1.0) * 255.0);
-
-		//hack
-		pix[3] = UINT8_MAX;
-	}
-}
-
 struct COVQTrainingApp
 {
 	enum CodecType
@@ -606,6 +520,7 @@ struct COVQTrainingApp
 
 	ev2::GfxContext *ctx;
 
+	std::vector<std::string> image_paths;
 	std::vector<Image> images;
 
 	//--------------------------------------------------------------------------
@@ -614,9 +529,14 @@ struct COVQTrainingApp
 	COVQParams covq_params;
 
 	// (3, count) dataset built from all of the images
-	Eigen::MatrixXd X;
+#ifdef USE_COVQ_DCT_CODEC
+	Eigen::MatrixXd X[64];
+	std::function<Eigen::MatrixXd(uint8_t k)> matrix_generator;
+#else
 	// channel matrix used for the next training iteration; guarded by `sync`
 	Eigen::MatrixXd P;
+	Eigen::MatrixXd X;
+#endif
 
 	// replaced under `training_sync`
 	struct {
@@ -624,7 +544,13 @@ struct COVQTrainingApp
 		std::vector<double> distortion_history;
 	} stats;
 
+#ifdef USE_COVQ_DCT_CODEC
+	std::unique_ptr<COVQDCTCodecTrainer> trainer;
+#else
 	std::unique_ptr<COVQTrainingContext> trainer;
+#endif
+
+
 	// incremented every time `codec` is replaced
 	std::atomic_uint32_t epoch = 0;
 
@@ -643,6 +569,7 @@ struct COVQTrainingApp
 
 	// null when the visualization is disabled
 	std::unique_ptr<COVQTrainingVisualization> training_viz;
+
 	std::atomic<std::shared_ptr<IBlockImageCodec>> avail_codec;
 	std::unique_ptr<IBlockImageCodec> baseline_codec;
 
@@ -657,6 +584,8 @@ struct COVQTrainingApp
 	std::weak_ptr<ev2::ImageViewer> covq_viewer {};
 	std::weak_ptr<ev2::ImageViewer> base_viewer {};
 
+	uint8_t bit_table[64];
+
 	struct Options {
 		const Image *selected_image = nullptr;
 		float eps_slider = 0.05;
@@ -667,6 +596,9 @@ struct COVQTrainingApp
 
 		// number of previous runs to plot data for.
 		int plot_history = 10;
+
+		int selected_viz_bin = 0;
+		int selected_bpp = 5;
 	} opts;
 
 	// must match map_image.frag
@@ -688,7 +620,7 @@ struct COVQTrainingApp
 
 	COVQTrainingApp();
 	~COVQTrainingApp();
-	int initialize(const COVQParams &in_params, std::vector<Image> && in_images);
+	int initialize(const COVQParams &in_params, std::vector<Image> &&in_images, std::vector<std::string> &&in_image_paths);
 	int update();
 
 	// @brief compress an image, transmit it through the channel, and upload to the GPU for display.
@@ -747,14 +679,20 @@ int COVQTrainingApp::reset_quantizer()
 {
 	{
 		std::unique_lock<std::mutex> lock(sync);
+#ifndef USE_COVQ_DCT_CODEC
 		P = transition_matrix(covq_params);
+#endif
 		stats.distortion_history.clear();
 		stats.dmax = 0;
 	}
 
 	{
 		std::unique_lock<std::mutex> lock(training_sync);
-		trainer.reset(covq_init(X, P));
+#ifdef USE_COVQ_DCT_CODEC
+		trainer.reset(COVQDCTCodecTrainer::create(X, bit_table, matrix_generator));
+#else
+		trainer.reset(COVQTrainingContext::create(X, P));
+#endif
 		avail_codec.store(nullptr);
 		desired_its.store(0);
 		completed_its.store(0);
@@ -769,15 +707,55 @@ int COVQTrainingApp::reset_quantizer()
 	return 0;
 }
 
+#ifdef USE_COVQ_DCT_CODEC
+// @brief create a visualization of RGB values in a DCT bin
+static COVQTrainingVisualization *create_dct_bin_visualization(
+	int bin, const Eigen::MatrixXd &data)
+{
+	double scale, offset;
+
+	// DC goes to [0,1]
+	if (bin == 0) {
+		scale = 1.0 / (8.0 * 255.0);
+		offset = 128.0 / 255.0;
+	} else {
+		std::vector<double> mags(data.size());
+		for (Eigen::Index i = 0; i < data.size(); ++i)
+			mags[i] = std::abs(data.data()[i]);
+
+		// Rescale the points so that ~99% stay within a unit [0,1] cube
+		double r = 0.0;
+		if (!mags.empty()) {
+			auto nth = mags.begin() + (mags.size() - 1) * 99 / 100;
+			std::nth_element(mags.begin(), nth, mags.end());
+			r = *nth;
+		}
+
+		scale = r > 0.0 ? 0.5 / r : 1.0;
+		offset = 0.5;
+	}
+
+	return COVQTrainingVisualization::create(data, scale, offset);
+}
+#endif
+
 void COVQTrainingApp::set_visualization_enabled(bool enabled)
 {
 	if (enabled == (training_viz != nullptr))
 		return;
 
+#ifdef USE_COVQ_DCT_CODEC
+	if (enabled) {
+		training_viz.reset(create_dct_bin_visualization(opts.selected_viz_bin, X[opts.selected_viz_bin]));
+	} else {
+		training_viz.reset();
+	}
+#else
 	if (enabled)
 		training_viz.reset(COVQTrainingVisualization::create(X));
 	else
 		training_viz.reset();
+#endif
 }
 
 void COVQTrainingApp::training_thread_func()
@@ -795,13 +773,19 @@ void COVQTrainingApp::training_thread_func()
 
 			{
 				std::unique_lock<std::mutex> lock(sync);
+#ifdef USE_COVQ_DCT_CODEC
+				for (int i = 0; i < 64; ++i) {
+					if (trainer->ctx[i])
+						trainer->ctx[i]->P = matrix_generator(trainer->ctx[i]->word_length);
+				}
+#else
 				trainer->P = this->P;
-
+#endif
 			}
 
 			uint32_t it = completed_its++;
 			printf("Iteration: %d\n", it);
-			covq_training_it(*trainer, X);
+			trainer->train(X);
 
 			{
 				std::unique_lock<std::mutex> lock(sync);
@@ -811,9 +795,15 @@ void COVQTrainingApp::training_thread_func()
 			}
 
 			{
-				std::shared_ptr<COVQTestImageCodec> codec = std::make_shared<COVQTestImageCodec>(
-					covq_create_codec(*trainer)
+#ifdef USE_COVQ_DCT_CODEC
+				std::shared_ptr<COVQDCTCodec> codec = std::shared_ptr<COVQDCTCodec>(
+					trainer->create_codec()
 				);
+#else
+				std::shared_ptr<COVQTestImageCodec> codec = std::make_shared<COVQTestImageCodec>(
+					trainer->create_codec()
+				);
+#endif
 				this->avail_codec.store(codec);
 				++epoch;
 			}
@@ -824,14 +814,25 @@ void COVQTrainingApp::training_thread_func()
 	}
 }
 
-int COVQTrainingApp::initialize(const COVQParams &in_params, std::vector<Image> && in_images)
+int COVQTrainingApp::initialize(const COVQParams &in_params,
+	std::vector<Image> &&in_images, std::vector<std::string> &&in_image_paths)
 {
 	covq_params = in_params;
 	images = std::move(in_images);
+	image_paths = std::move(in_image_paths);
 
 	opts.eps_slider = covq_params.eps;
 
+	memcpy(bit_table, BitTables::bpp_2, 64);
+
+#ifdef USE_COVQ_DCT_CODEC
+	matrix_generator = [eps = covq_params.eps](uint8_t k) {
+		return bsc_matrix(k, eps);
+	};
+	COVQDCTCodecTrainer::generate_data(3, (uint32_t)images.size(), images.data(), X);
+#else
 	X = images_to_matrix(images);
+#endif
 
 	reset_quantizer();
 
@@ -869,21 +870,6 @@ int COVQTrainingApp::view_image(const Image &in_image)
 	orig_viewer = ev2::editor::open_image_viewer(disp_image,
 		"Baseline Image", /*"cap://pipeline/test_image.yaml"*/ nullptr);
 
-	size_t offset = 0;
-	for (const Image &image : images) {
-		if (image.path == in_image.path)
-			break;
-
-		offset += image.w * image.h;
-	}
-
-	pc.image_start = offset;
-	pc.image_end = offset + in_image.w * in_image.h;
-
-	pc.size = glm::ivec2(
-		in_image.w,
-		in_image.h
-	);
 	return 0;
 }
 
@@ -1005,7 +991,7 @@ void COVQTrainingApp::draw_image_gui()
 
 		switch(codec_type) {
 			case CODEC_TYPE_UNIFORM_DCT:
-				baseline_codec.reset(new DCTImageCodec(new UniformDCTQuantizer(BitTables::bpp_1)));
+				baseline_codec.reset(new DCTImageCodec(new UniformDCTQuantizer(bit_table)));
 				break;
 			case CODEC_TYPE_VQ_PIX:
 				break;
@@ -1043,9 +1029,33 @@ void COVQTrainingApp::draw_image_gui()
 		}
 	}
 
+	ImGui::SeparatorText("Rate");
+	if (ImGui::Combo("Quality", &opts.selected_bpp,
+		"DC\0Full\0""0.25 bpp\0""0.5 bpp\0""1 bpp\0""2 bpp\0""4 bpp")) {
+		switch(opts.selected_bpp) {
+			case 0:
+				memcpy(bit_table, BitTables::dc_only, 64); break;
+			case 1:
+				memcpy(bit_table, BitTables::full, 64); break;
+			case 2:
+				memcpy(bit_table, BitTables::bpp_0_25, 64); break;
+			case 3:
+				memcpy(bit_table, BitTables::bpp_0_5, 64); break;
+			case 4:
+				memcpy(bit_table, BitTables::bpp_1, 64); break;
+			case 5:
+				memcpy(bit_table, BitTables::bpp_2, 64); break;
+			case 6:
+				memcpy(bit_table, BitTables::bpp_4, 64); break;
+		}
+		baseline_codec.reset(new DCTImageCodec(new UniformDCTQuantizer(bit_table)));
+	}
+
 	ImGui::SeparatorText("Images");
-	for (const Image &image : images) {
-		if (ImGui::Selectable(image.path.c_str(), opts.selected_image == &image)) {
+	for (size_t i = 0; i < images.size(); ++i) {
+		const Image &image = images[i];
+		const char *path = image_paths[i].c_str();
+		if (ImGui::Selectable(path, opts.selected_image == &image)) {
 			new_image = &image;
 		}
 	}
@@ -1080,6 +1090,18 @@ int COVQTrainingApp::update()
 			set_visualization_enabled(viz_enabled);
 		ImGui::SetItemTooltip("Disabling frees all GPU resources used by the visualization");
 
+#ifdef USE_COVQ_DCT_CODEC
+		int selected_viz_bin = opts.selected_viz_bin;
+		if (ImGui::SliderInt("Selected bin", &selected_viz_bin, 0, 63)) {
+			if (viz_enabled && trainer->ctx[selected_viz_bin]) {
+				opts.selected_viz_bin = std::clamp(selected_viz_bin, 0, 63);
+				COVQTrainingVisualization::Options old_viz_options = training_viz->opts;
+				training_viz.reset(create_dct_bin_visualization(selected_viz_bin, X[selected_viz_bin]));
+				training_viz->opts = old_viz_options;
+			}
+		}
+#endif
+
 		if (training_viz)
 			training_viz->draw_gui();
 
@@ -1102,13 +1124,27 @@ int COVQTrainingApp::update()
 	if (opts.eps_slider != covq_params.eps) {
 		std::unique_lock<std::mutex> lock(sync);
 		covq_params.eps = opts.eps_slider;
+#ifdef USE_COVQ_DCT_CODEC
+		matrix_generator = [eps = covq_params.eps](uint8_t k) {
+			return bsc_matrix(k, eps);
+		};
+#else
 		P = transition_matrix(covq_params);
+#endif
+
 	}
 
+#ifdef USE_COVQ_DCT_CODEC
+	if (training_viz) {
+		training_viz->sync(*trainer->ctx[opts.selected_viz_bin], &training_sync);
+		training_viz->render();
+	}
+#else
 	if (training_viz) {
 		training_viz->sync(*trainer, &training_sync);
 		training_viz->render();
 	}
+#endif
 
 	render_image();
 
@@ -1152,6 +1188,7 @@ int main(int argc, char *argv[])
 		.eps = 0.05
 	};
 
+	std::vector<std::string> image_paths;
 	std::vector<Image> images;
 
 	for (int i = 1; i < argc; ++i) {
@@ -1178,10 +1215,12 @@ int main(int argc, char *argv[])
 			}  else {
 				for (size_t j = 0; j < g.gl_pathc; ++j) {
 					Image img;
-					int result = load_image(g.gl_pathv[j], &img);
+					const char *path = g.gl_pathv[j];
+					int result = load_image(path, &img);
 
 					if (result == 0) {
-						images.push_back(std::move(img));
+						images.emplace_back(std::move(img));
+						image_paths.emplace_back(path);
 					}
 				}
 			}
@@ -1198,7 +1237,7 @@ int main(int argc, char *argv[])
 
 	std::unique_ptr<COVQTrainingApp> app = std::make_unique<COVQTrainingApp>();
 
-	app->initialize(params, std::move(images));
+	app->initialize(params, std::move(images), std::move(image_paths));
 
 	for (;;) {
 		if (status = ev2::editor::begin_frame(); status != ev2::SUCCESS)

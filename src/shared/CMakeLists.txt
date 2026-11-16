@@ -2,6 +2,7 @@ add_library(shared STATIC
 	covq.cpp
 	stb_image.cpp
 	codec.cpp
+	covq_image_codec.cpp
 )
 
 target_include_directories(shared

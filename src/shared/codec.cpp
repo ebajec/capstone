@@ -18,7 +18,7 @@ void DCTImageCodec::encode(uint32_t w, uint32_t h, uint32_t ch,
 			const uint8_t *in_bytes, uint8_t *out_bytes) const
 {
 	float coeffs[64];
-	uint8_t blk[64];
+	float blk[64];
 
 	size_t bit_idx = 0;
 
@@ -27,15 +27,16 @@ void DCTImageCodec::encode(uint32_t w, uint32_t h, uint32_t ch,
 			// go over channels within the block
 
 			for (uint32_t c = 0; c < ch; ++c) {
+
 				// strided reads for each channel; repeat the edge pixels
 				for (uint32_t iy = 0; iy < 8; ++iy) {
 					const size_t src_y = std::min(by + iy, h - 1);
 					for (uint32_t ix = 0; ix < 8; ++ix) {
 						const size_t src_x = std::min(bx + ix, w - 1);
-						blk[iy * 8 + ix] = in_bytes[(src_y * w + src_x) * ch + c];
+						blk[iy * 8 + ix] = dct8::unpack_u8(in_bytes[(src_y * w + src_x) * ch + c]);
 					}
 				}
-				dct8::forward_u8(blk, 8, coeffs);
+				dct8::forward(blk, coeffs);
 
 				bit_idx += quantizer->encode_blk(coeffs, out_bytes, bit_idx);
 			}
@@ -47,7 +48,7 @@ void DCTImageCodec::decode(uint32_t w, uint32_t h, uint32_t ch,
 					 const uint8_t *in_bytes, uint8_t *out_bytes) const
 {
 	float coeffs[64];
-	uint8_t blk[64];
+	float blk[64];
 
 	size_t bit_idx = 0;
 	for (uint32_t by = 0; by < h; by += 8) {
@@ -60,13 +61,14 @@ void DCTImageCodec::decode(uint32_t w, uint32_t h, uint32_t ch,
 			for (uint32_t c = 0; c < ch; ++c) {
 				bit_idx += quantizer->decode_blk(in_bytes, bit_idx, coeffs);
 
-				dct8::inverse_u8(coeffs, blk, 8);
+				dct8::inverse(coeffs, blk);
 
 				for (uint32_t iy = 0; iy < lh; ++iy) {
 					const size_t dst_y = by + iy;
 					for (uint32_t ix = 0; ix < lw; ++ix) {
 						const size_t dst_x = bx + ix;
-						out_bytes[(dst_y * w + dst_x) * ch + c] = blk[iy * 8 + ix];
+
+						out_bytes[(dst_y * w + dst_x) * ch + c] = dct8::pack_u8(blk[iy * 8 + ix]);
 					}
 				}
 			}

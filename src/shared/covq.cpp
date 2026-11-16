@@ -107,7 +107,7 @@ constexpr uint32_t bits_to_base_3(uint32_t w, int k)
 	return v;
 }
 
-COVQTrainingContext *covq_init(
+COVQTrainingContext *COVQTrainingContext::create(
 	const Eigen::MatrixXd& X,
 	const Eigen::MatrixXd &P
 )
@@ -159,88 +159,99 @@ COVQTrainingContext *covq_init(
 	return ctx;
 }
 
+//#define LOG_COVQ_TRAINING
+
 // @param X - (dim , count) input dataset
 // @param P - (N , N) channel transition probabilities; P(i, j) = p(j|i)
-void covq_training_it(
-	COVQTrainingContext &ctx,
-	const Eigen::MatrixXd &X
-)
+void COVQTrainingContext::train(const Eigen::MatrixXd& X, bool log)
 {
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 1
 
+#ifdef LOG_COVQ_TRAINING
 	printf("------------------------------------------------\n");
-
 	TIMER_BEGIN(TrainingIteration);
+#endif
 
-	ctx.Y.setZero();
-	ctx.Y.noalias() = ctx.centroids * ctx.P;
+	Y.setZero();
+	Y.noalias() = centroids * P;
 
 	uint32_t num_nonzero_prob = 0;
 
-	for (uint32_t j = 0; j < ctx.N; ++j) {
-		double prob_j = (ctx.probs * ctx.P.col(j))(0,0);
+	for (uint32_t j = 0; j < N; ++j) {
+		double prob_j = (probs * P.col(j))(0,0);
 
 		// TODO: Ignore when probability is near zero
 		if (fabs(prob_j) < ZERO_PROB_THRESHOLD) {
-			ctx.Y.col(j).setZero();
+			Y.col(j).setZero();
 		} else {
-			ctx.Y.col(j) /= prob_j;
+			Y.col(j) /= prob_j;
 			++num_nonzero_prob;
 		}
 	}
 
-	ctx.num_possible_codepoints = num_nonzero_prob;
+	num_possible_codepoints = num_nonzero_prob;
 
-	ctx.E.noalias() = ctx.Y * ctx.P.transpose();
-	ctx.v.noalias() = ctx.P * ctx.Y.colwise().squaredNorm().transpose();
+	E.noalias() = Y * P.transpose();
+	v.noalias() = P * Y.colwise().squaredNorm().transpose();
 
 
+#ifdef LOG_COVQ_TRAINING
 	TIMER_BEGIN(Centroids);
+#endif
+
 	double d_sum = 0;
 	#pragma omp parallel reduction(+:d_sum)
 	{
-		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(ctx.M);
+		Eigen::VectorXd d_tls = Eigen::VectorXd::Zero(M);
 
 		double d_expected_tls = 0;
 
 		#pragma omp for schedule(dynamic)
-		for (uint32_t c = 0; c < ctx.count; ++c) {
+		for (uint32_t c = 0; c < count; ++c) {
 			uint32_t argmin = 0;
 
-			d_tls.noalias() = ctx.v - 2.0 * (ctx.E.transpose() * X.col(c));
+			d_tls.noalias() = v - 2.0 * (E.transpose() * X.col(c));
 			double d = d_tls.minCoeff(&argmin);
 			uint32_t idx = argmin;
 
 			d_sum += d + X.col(c).squaredNorm();
-			ctx.mapping[c] = idx;
+			mapping[c] = idx;
 		}
 	}
-	TIMER_END(Centroids);
-	double d_expected = d_sum / (double)ctx.count;
 
+#ifdef LOG_COVQ_TRAINING
+		TIMER_END(Centroids);
+#endif
+
+	double d_expected = d_sum / (double)count;
+
+#ifdef LOG_COVQ_TRAINING
 	printf("Expected distortion: %.6f\n", d_expected);
+#endif
 
-	ctx.expected_distortion = d_expected;
+	expected_distortion = d_expected;
 
 	// accumulate partition centroids
-	ctx.centroids.setZero();
-	ctx.probs.setZero();
+	centroids.setZero();
+	probs.setZero();
 
-	for (uint32_t c = 0; c < ctx.count; ++c) {
-		uint32_t idx = ctx.mapping[c];
-		ctx.probs(0, idx) += 1.0;
-		ctx.centroids.col(idx).noalias() += X.col(c);
+	for (uint32_t c = 0; c < count; ++c) {
+		uint32_t idx = mapping[c];
+		probs(0, idx) += 1.0;
+		centroids.col(idx).noalias() += X.col(c);
 	}
 
 	const double p_x = 1.0 / X.cols(); 
 
-	ctx.probs *= p_x;
-	ctx.centroids *= p_x;
+	probs *= p_x;
+	centroids *= p_x;
 
-	++ctx.epoch;
+	++epoch;
 
-	TIMER_END(TrainingIteration);
+#ifdef LOG_COVQ_TRAINING
+		TIMER_END(TrainingIteration);
+#endif
 
 #undef EIGEN_USE_AVX512_GEMM_KERNELS
 #define EIGEN_USE_AVX512_GEMM_KERNELS 0
@@ -275,19 +286,19 @@ static void covq_init_encoder(COVQCodec *codec)
 	codec->encoder.index_map = std::move(index_map);
 }
 
-COVQCodec *covq_create_codec(const COVQTrainingContext &ctx)
+COVQCodec *COVQTrainingContext::create_codec()
 {
 	COVQCodec *codec = new COVQCodec{COVQCodec{
-		.dim = ctx.dim,
-		.N = ctx.N,
-		.M = ctx.M,
-		.word_length = ctx.word_length,
+		.dim = dim,
+		.N = N,
+		.M = M,
+		.word_length = word_length,
 
-		.codebook = ctx.Y,
-		.centroids = ctx.centroids,
-		.probs = ctx.probs,
+		.codebook = Y,
+		.centroids = centroids,
+		.probs = probs,
 
-		.P = ctx.P
+		.P = P
 	}};
 
 	covq_init_encoder(codec);

@@ -149,8 +149,7 @@ static constexpr size_t write_bits(
 }
 
 // @return offset + nbits
-static constexpr size_t read_bits(
-	uint32_t& word, int nbits, const uint8_t *bytes, size_t offset)
+static constexpr size_t read_bits( uint32_t& word, int nbits, const uint8_t *bytes, size_t offset)
 {
 	word = 0;
 	for (uint32_t j = 0; j < nbits; ++j) {
