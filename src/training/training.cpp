@@ -2,6 +2,7 @@
 #include "stb_image.h"
 #include "codec.h"
 #include "covq_image_codec.h"
+#include "timers.h"
 
 #include <ev2/editor.h>
 #include <ev2/viewport.h>

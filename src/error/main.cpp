@@ -1,19 +1,35 @@
 #include "codec.h"
-#include "covq.h"
+#include "timers.h"
 
-#include <cstring>
-#include <memory>
 #include <random>
 
+// ---------------------------------------------------------------------------------
+// ECC interface
 struct IErrorCorrectingCode
 {
-    virtual ~IErrorCorrectingCode() = default;
+    // Useful function for counting num of encoded/decoded bits given an input size
+    virtual constexpr size_t num_encoded_bits(size_t count) const = 0;
+    virtual constexpr size_t num_decoded_bits(size_t count) const = 0;
+
+    constexpr size_t num_encoded_bytes(size_t count) const
+    {
+        const size_t bits = num_encoded_bits(count);
+        return bits / 8 + (bits % 8 != 0);
+    }
+
+    constexpr size_t num_decoded_bytes(size_t count) const
+    {
+        const size_t bits = num_decoded_bits(count);
+        return bits / 8 + (bits % 8 != 0);
+    }
 
     virtual void encode(uint8_t* out, size_t count, const uint8_t* in) const = 0;
     virtual void decode(uint8_t* out, size_t count, const uint8_t* in) const = 0;
 };
+// ---------------------------------------------------------------------------------
 
-// Repeat each input bit three times, then decode each triple by majority.
+// ---------------------------------------------------------------------------------
+// Repetition codex repeat each input bit three times, then decode each triple by majority.
 // Original:  1   0   1
 // Encoded:  111 000 111
 // Received: 101 001 111
@@ -22,10 +38,16 @@ struct RepetitionCode final : public IErrorCorrectingCode
 {
     static constexpr uint32_t repetitions = 3;
 
+    // For repetition codes, the number of encoded and decoded bits its scaled by num_repetitions
+    constexpr size_t num_encoded_bits(size_t count) const override { return count * repetitions; }
+    constexpr size_t num_decoded_bits(size_t count) const override { return count / repetitions; }
+
     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
 };
+// ---------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------
 // Hamming code: https://en.wikipedia.org/wiki/Hamming_code
 // Needs data and parity bits satisfying: 2^p >= d + p + 1
 // Parity bits are placed in positions which are powers of 2 (i.e. 1, 2, 4, 8, etc.)
@@ -34,6 +56,9 @@ struct HammingCode final : public IErrorCorrectingCode
     static constexpr size_t DataBits = 8;
     static constexpr size_t EncodedBits = 12;
 
+    constexpr size_t num_encoded_bits(size_t count) const override;
+    constexpr size_t num_decoded_bits(size_t count) const override;
+
     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
 
@@ -41,6 +66,7 @@ private:
     static constexpr uint32_t encodeBlock(uint32_t data);
     static constexpr uint32_t decodeBlock(uint32_t encoded);
 };
+// ---------------------------------------------------------------------------------
 
 void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 {
@@ -57,7 +83,7 @@ void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 
 void RepetitionCode::decode(uint8_t* out, size_t count, const uint8_t* in) const
 {
-    const size_t out_count = count / repetitions;
+    const size_t out_count = num_decoded_bits(count);
     size_t input_offset = 0;
     for (size_t i = 0; i < out_count; ++i)
     {
@@ -75,7 +101,7 @@ void RepetitionCode::decode(uint8_t* out, size_t count, const uint8_t* in) const
     }
 }
 
-void HammingCode::encode(uint8_t* out, size_t count, const uint8_t* in)  const
+constexpr size_t HammingCode::num_encoded_bits(size_t count) const
 {
     // Shorten the final codeword to preserve the input bit count.
     const size_t d = count % DataBits;
@@ -83,7 +109,23 @@ void HammingCode::encode(uint8_t* out, size_t count, const uint8_t* in)  const
     while((1 << p) < d + p + 1)
         p++;
 
-    size_t out_count = (count / DataBits) * EncodedBits + d + p;
+    return (count / DataBits) * EncodedBits + d + p;
+}
+
+constexpr size_t HammingCode::num_decoded_bits(size_t count) const
+{
+    // Count parity positions in the final shortened codeword.
+    const size_t n = count % EncodedBits;
+    size_t p = 0;
+    while((1 << p) <= n)
+        p++;
+
+    return (count / EncodedBits) * DataBits + (n - p);
+}
+
+void HammingCode::encode(uint8_t* out, size_t count, const uint8_t* in)  const
+{
+    const size_t out_count = num_encoded_bits(count);
     size_t output_offset = 0;
 
     for(size_t i = 0; i < count; i += DataBits)
@@ -101,13 +143,7 @@ void HammingCode::encode(uint8_t* out, size_t count, const uint8_t* in)  const
 
 void HammingCode::decode(uint8_t* out, size_t count, const uint8_t* in)  const
 {
-    // Count parity positions in the final shortened codeword.
-    const size_t n = count % EncodedBits;
-    size_t p = 0;
-    while((1 << p) <= n)
-        p++;
-
-    size_t out_count = (count / EncodedBits) * DataBits + n - p;
+    const size_t out_count = num_decoded_bits(count);
     size_t output_offset = 0;
 
     for(size_t i = 0; i < count; i += EncodedBits)
@@ -230,16 +266,17 @@ int main(int argc, char** argv)
         }
     }
 
-    HammingCode codec;
+    constexpr HammingCode codec;
 
     constexpr size_t input_byte_count = 1024 * 1024; // 1 MB example
     constexpr size_t input_bit_count = input_byte_count * 8;
-    constexpr size_t encoded_bit_count = (input_bit_count / HammingCode::DataBits) * HammingCode::EncodedBits;
-    constexpr size_t encoded_byte_count = (encoded_bit_count + 7) / 8;
+    constexpr size_t encoded_bit_count = codec.num_encoded_bits(input_bit_count);
+    constexpr size_t encoded_byte_count = codec.num_encoded_bytes(input_bit_count);
+    constexpr size_t decoded_byte_count = codec.num_decoded_bytes(encoded_bit_count);
 
     auto bytes = std::make_unique<uint8_t[]>(input_byte_count);
     auto encoded = std::make_unique<uint8_t[]>(encoded_byte_count);
-    auto decoded = std::make_unique<uint8_t[]>(input_byte_count);
+    auto decoded = std::make_unique<uint8_t[]>(decoded_byte_count);
 
     std::mt19937 random(0);
     for (size_t i = 0; i < input_byte_count; ++i)
