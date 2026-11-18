@@ -1,5 +1,6 @@
 #include "covq_image_codec.h"
 #include "dct8.hpp"
+#include "timers.h"
 
 #include <cassert>
 
