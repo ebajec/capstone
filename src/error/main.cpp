@@ -29,7 +29,7 @@ struct IErrorCorrectingCode
 // ---------------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------------
-// Repetition codex repeat each input bit three times, then decode each triple by majority.
+// Repetition codes repeat each input bit three times, then decode each triple by majority.
 // Original:  1   0   1
 // Encoded:  111 000 111
 // Received: 101 001 111
@@ -51,6 +51,7 @@ struct RepetitionCode final : public IErrorCorrectingCode
 // Hamming code: https://en.wikipedia.org/wiki/Hamming_code
 // Needs data and parity bits satisfying: 2^p >= d + p + 1
 // Parity bits are placed in positions which are powers of 2 (i.e. 1, 2, 4, 8, etc.)
+// Parity bits are used to verify a set of bits within the code and are corrected during decoding
 struct HammingCode final : public IErrorCorrectingCode
 {
     static constexpr size_t DataBits = 8;
