@@ -1,64 +1,16 @@
 #include "codec.h"
 #include "covq.h"
 
+#include <cstring>
+#include <memory>
 #include <random>
-
-using Bytes = std::vector<std::uint8_t>;
-
-struct BitBuffer
-{
-    Bytes bytes;
-    size_t bit_count = 0;
-
-    std::string toString() const;
-    static std::vector<BitBuffer> chunkBitBuffer(const BitBuffer& in, size_t size);
-};
-
-std::string BitBuffer::toString() const
-{
-    std::string result;
-    result.reserve(bit_count);
-   
-    for (size_t i = 0; i < bit_count; ++i)
-    {
-        uint32_t bit = 0;
-        read_bits(bit, 1, bytes.data(), i);
-        result += std::to_string(bit);
-    }
-
-    return result;
-}
-
-std::vector<BitBuffer> BitBuffer::chunkBitBuffer(const BitBuffer& in, size_t size)
-{
-    std::vector<BitBuffer> out;
-
-    for(size_t i = 0; i < in.bit_count; i += size)
-    {
-        const size_t min_size = std::min(size, in.bit_count - i);
-
-        uint32_t word;
-        read_bits(word, min_size, in.bytes.data(), i);
-
-        BitBuffer component = BitBuffer{
-            .bytes = Bytes((size + 7) / 8, 0),
-            .bit_count = size,
-        };
-
-        write_bits(word, min_size, component.bytes.data(), 0);
-
-        out.emplace_back(std::move(component));
-    }
-
-    return out;
-}
 
 struct IErrorCorrectingCode
 {
     virtual ~IErrorCorrectingCode() = default;
 
-    virtual BitBuffer encode(const BitBuffer& in) const = 0;
-    virtual BitBuffer decode(const BitBuffer& in) const = 0;
+    virtual void encode(uint8_t* out, size_t count, const uint8_t* in) const = 0;
+    virtual void decode(uint8_t* out, size_t count, const uint8_t* in) const = 0;
 };
 
 // Repeat each input bit three times, then decode each triple by majority.
@@ -70,8 +22,8 @@ struct RepetitionCode final : public IErrorCorrectingCode
 {
     static constexpr uint32_t repetitions = 3;
 
-    BitBuffer encode(const BitBuffer& in) const override;
-    BitBuffer decode(const BitBuffer& in) const override;
+    void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
+    void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
 };
 
 // Hamming code: https://en.wikipedia.org/wiki/Hamming_code
@@ -79,120 +31,100 @@ struct RepetitionCode final : public IErrorCorrectingCode
 // Parity bits are placed in positions which are powers of 2 (i.e. 1, 2, 4, 8, etc.)
 struct HammingCode final : public IErrorCorrectingCode
 {
-    BitBuffer encode(const BitBuffer& in) const override;
-    BitBuffer decode(const BitBuffer& in) const override;
+    static constexpr size_t DataBits = 8;
+    static constexpr size_t EncodedBits = 12;
+
+    void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
+    void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
 
 private:
-    static constexpr size_t DataBits = 8; // d
-    static constexpr size_t EncodedBits = 12; // d + p + 1
-
-    static uint32_t encodeBlock(uint32_t data);
-    static uint32_t decodeBlock(uint32_t encoded);
+    static constexpr uint32_t encodeBlock(uint32_t data);
+    static constexpr uint32_t decodeBlock(uint32_t encoded);
 };
 
-BitBuffer RepetitionCode::encode(const BitBuffer& in) const
+void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 {
-    BitBuffer out;
-    out.bit_count = in.bit_count * repetitions;
-    out.bytes.resize(out.bit_count, 0);
-
     size_t output_offset = 0;
-    for (size_t i = 0; i < in.bit_count; ++i)
+    for (size_t i = 0; i < count; ++i)
     {
         uint32_t bit = 0;
-        read_bits(bit, 1, in.bytes.data(), i); // Read one bit at a time
+        read_bits(bit, 1, in, i); // Read one bit at a time
 
         for (uint32_t j = 0; j < repetitions; ++j)
-            output_offset = write_bits(bit, 1, out.bytes.data(), output_offset);
+            output_offset = write_bits(bit, 1, out, output_offset);
     }
-
-    return out;
 }
 
-BitBuffer RepetitionCode::decode(const BitBuffer& in) const
+void RepetitionCode::decode(uint8_t* out, size_t count, const uint8_t* in) const
 {
-    BitBuffer out;
-    out.bit_count = in.bit_count / repetitions;
-    out.bytes.resize(out.bit_count, 0);
-
+    const size_t out_count = count / repetitions;
     size_t input_offset = 0;
-    for (size_t i = 0; i < out.bit_count; ++i)
+    for (size_t i = 0; i < out_count; ++i)
     {
         uint32_t ones = 0;
         for (uint32_t j = 0; j < repetitions; ++j)
         {
             uint32_t bit;
-            input_offset = read_bits(bit, 1, in.bytes.data(), input_offset);
+            input_offset = read_bits(bit, 1, in, input_offset);
             ones += bit; // count number of ones
         }
 
         // If we have more ones than the number of repetitions over 2, then we decode a 1, otherwise 0
         const uint32_t bit = ones > repetitions / 2 ? 1 : 0;
-        write_bits(bit, 1, out.bytes.data(), i);
+        write_bits(bit, 1, out, i);
     }
-
-    return out;
 }
 
-
-BitBuffer HammingCode::encode(const BitBuffer& in) const
+void HammingCode::encode(uint8_t* out, size_t count, const uint8_t* in)  const
 {
     // Shorten the final codeword to preserve the input bit count.
-    const size_t d = in.bit_count % DataBits;
+    const size_t d = count % DataBits;
     size_t p = 0;
     while((1 << p) < d + p + 1)
         p++;
 
-    BitBuffer out;
-    out.bit_count = (in.bit_count / DataBits) * EncodedBits + d + p;
-    out.bytes.resize((out.bit_count + 7) / 8, 0);
-
+    size_t out_count = (count / DataBits) * EncodedBits + d + p;
     size_t output_offset = 0;
-    for(size_t i = 0; i < in.bit_count; i += DataBits)
+
+    for(size_t i = 0; i < count; i += DataBits)
     {
-        const size_t min_size = std::min(DataBits, in.bit_count - i);
+        const size_t min_size = std::min(DataBits, count - i);
 
         uint32_t data;
-        read_bits(data, min_size, in.bytes.data(), i);
+        read_bits(data, min_size, in, i);
 
         const uint32_t encoded = encodeBlock(data); // Add redundancy
-        const size_t encoded_size = std::min(EncodedBits, out.bit_count - output_offset);
-        output_offset = write_bits(encoded, encoded_size, out.bytes.data(), output_offset);
+        const size_t encoded_size = std::min(EncodedBits, out_count - output_offset);
+        output_offset = write_bits(encoded, encoded_size, out, output_offset);
     }
-
-    return out;
 }
 
-BitBuffer HammingCode::decode(const BitBuffer& in) const
+void HammingCode::decode(uint8_t* out, size_t count, const uint8_t* in)  const
 {
     // Count parity positions in the final shortened codeword.
-    const size_t n = in.bit_count % EncodedBits;
+    const size_t n = count % EncodedBits;
     size_t p = 0;
     while((1 << p) <= n)
         p++;
 
-    BitBuffer out;
-    out.bit_count = (in.bit_count / EncodedBits) * DataBits + n - p;
-    out.bytes.resize((out.bit_count + 7) / 8, 0);
-
+    size_t out_count = (count / EncodedBits) * DataBits + n - p;
     size_t output_offset = 0;
-    for(size_t i = 0; i < in.bit_count; i += EncodedBits)
+
+    for(size_t i = 0; i < count; i += EncodedBits)
     {
-        const size_t min_size = std::min(EncodedBits, in.bit_count - i);
+        const size_t min_size = std::min(EncodedBits, count - i);
 
-        uint32_t encoded;
-        read_bits(encoded, min_size, in.bytes.data(), i);
+        uint32_t data;
+        read_bits(data, min_size, in, i);
 
-        const uint32_t data = decodeBlock(encoded); // Remove redundancy and correct errors
-        const size_t data_size = std::min(DataBits, out.bit_count - output_offset);
+        const uint32_t decoded = decodeBlock(data); // Remove redundancy and correct errors
+        const size_t data_size = std::min(DataBits, out_count - output_offset);
         if(data_size != 0)
-            output_offset = write_bits(data, data_size, out.bytes.data(), output_offset);
+            output_offset = write_bits(decoded, data_size, out, output_offset);
     }
-
-    return out;
 }
 
-uint32_t HammingCode::encodeBlock(uint32_t data)
+constexpr uint32_t HammingCode::encodeBlock(uint32_t data)
 {
     uint32_t out = 0;
 
@@ -236,7 +168,7 @@ uint32_t HammingCode::encodeBlock(uint32_t data)
     return out;
 }
 
-uint32_t HammingCode::decodeBlock(uint32_t encoded)
+constexpr uint32_t HammingCode::decodeBlock(uint32_t encoded)
 {
     // Check parity groups
     size_t error_position = 0;
@@ -300,35 +232,37 @@ int main(int argc, char** argv)
 
     HammingCode codec;
 
-    constexpr size_t input_size = 1024 * 1024; // 1 MB example
-    BitBuffer input = BitBuffer{
-        .bytes = Bytes(input_size, 0),
-        .bit_count = input_size * 8,
-    };
+    constexpr size_t input_byte_count = 1024 * 1024; // 1 MB example
+    constexpr size_t input_bit_count = input_byte_count * 8;
+    constexpr size_t encoded_bit_count = (input_bit_count / HammingCode::DataBits) * HammingCode::EncodedBits;
+    constexpr size_t encoded_byte_count = (encoded_bit_count + 7) / 8;
+
+    auto bytes = std::make_unique<uint8_t[]>(input_byte_count);
+    auto encoded = std::make_unique<uint8_t[]>(encoded_byte_count);
+    auto decoded = std::make_unique<uint8_t[]>(input_byte_count);
 
     std::mt19937 random(0);
-    for(auto& byte : input.bytes)
-        byte = uint8_t(random());
+    for (size_t i = 0; i < input_byte_count; ++i)
+        bytes[i] = uint8_t(random());
 
-    printf("Input: %zu bytes (%zu bits)\n", input.bytes.size(), input.bit_count);
+    printf("Input: %zu bytes (%zu bits)\n", input_byte_count, input_bit_count);
 
     TIMER_BEGIN(Encode)
-    BitBuffer encoded = codec.encode(input);
+    codec.encode(encoded.get(), input_bit_count, bytes.get());
     TIMER_END(Encode)
 
-    printf("Encoded: %zu bytes (%zu bits)\n", encoded.bytes.size(), encoded.bit_count);
+    printf("Encoded: %zu bytes (%zu bits)\n", encoded_byte_count, encoded_bit_count);
 
-    // Here I'll flip one of the encoded bits for each byte
-    for(size_t i = 2; i < encoded.bit_count; i += 12)
+    for(size_t i = 2; i < encoded_bit_count; i += HammingCode::EncodedBits)
     {
-        encoded.bytes[i / 8] ^= uint8_t(1 << (i % 8));
+        encoded[i / 8] ^= uint8_t(1u << (i % 8));
     }
 
     TIMER_BEGIN(Decode)
-    const BitBuffer decoded = codec.decode(encoded);
+    codec.decode(decoded.get(), encoded_bit_count, encoded.get());
     TIMER_END(Decode)
 
-    const bool matches = decoded.bit_count == input.bit_count && decoded.bytes == input.bytes;
+    const bool matches = std::memcmp(decoded.get(), bytes.get(), input_byte_count) == 0;
     printf("Decoded matches input: %s\n", matches ? "yes" : "no");
 
     return matches ? 0 : 1;
