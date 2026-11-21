@@ -2,6 +2,7 @@
 #include "stb_image.h"
 #include "codec.h"
 #include "covq_image_codec.h"
+#include "timers.h"
 
 #include <ev2/editor.h>
 #include <ev2/viewport.h>
@@ -20,6 +21,7 @@
 #include <bit>
 #include <thread>
 #include <algorithm>
+#include <memory>
 
 #define USE_COVQ_DCT_CODEC
 
@@ -502,7 +504,7 @@ void COVQTrainingVisualization::draw_gui()
 	if (synced_epoch == INVALID_EPOCH)
 		ImGui::TextDisabled("Codepoints: %u (%u possible, not synced)", num_codepoints, num_possible_codepoints);
 	else
-		ImGui::TextDisabled("Codepoints: %u (%u possible, epoch %lu)", num_codepoints, num_possible_codepoints, synced_epoch);
+		ImGui::TextDisabled("Codepoints: %u (%u possible, epoch %llu)", num_codepoints, num_possible_codepoints, synced_epoch);
 
 	ImGui::PopID();
 }
@@ -569,8 +571,8 @@ struct COVQTrainingApp
 
 	// null when the visualization is disabled
 	std::unique_ptr<COVQTrainingVisualization> training_viz;
-
-	std::atomic<std::shared_ptr<IBlockImageCodec>> avail_codec;
+	// Access through std::atomic_load/store (for older libc++ compatibility)
+	std::shared_ptr<IBlockImageCodec> avail_codec;
 	std::unique_ptr<IBlockImageCodec> baseline_codec;
 
 	//--------------------------------------------------------------------------
@@ -693,7 +695,7 @@ int COVQTrainingApp::reset_quantizer()
 #else
 		trainer.reset(COVQTrainingContext::create(X, P));
 #endif
-		avail_codec.store(nullptr);
+		std::atomic_store(&avail_codec, std::shared_ptr<IBlockImageCodec>{});
 		desired_its.store(0);
 		completed_its.store(0);
 	}
@@ -796,15 +798,13 @@ void COVQTrainingApp::training_thread_func()
 
 			{
 #ifdef USE_COVQ_DCT_CODEC
-				std::shared_ptr<COVQDCTCodec> codec = std::shared_ptr<COVQDCTCodec>(
-					trainer->create_codec()
-				);
+				std::shared_ptr<IBlockImageCodec> codec(trainer->create_codec());
 #else
-				std::shared_ptr<COVQTestImageCodec> codec = std::make_shared<COVQTestImageCodec>(
+				std::shared_ptr<IBlockImageCodec> codec = std::make_shared<COVQTestImageCodec>(
 					trainer->create_codec()
 				);
 #endif
-				this->avail_codec.store(codec);
+				std::atomic_store(&avail_codec, codec);
 				++epoch;
 			}
 		} else{
@@ -1021,7 +1021,7 @@ void COVQTrainingApp::draw_image_gui()
 
 	if (ImGui::Button("Compress and transmit##1")) {
 		if (opts.selected_image) {
-			if (std::shared_ptr<IBlockImageCodec> codec = avail_codec.load()) {
+			if (std::shared_ptr<IBlockImageCodec> codec = std::atomic_load(&avail_codec)) {
 				ev2::editor::close_image_viewer(covq_viewer.lock());
 				compress_and_transmit(*codec, *opts.selected_image, covq_image);
 				covq_viewer = ev2::editor::open_image_viewer(covq_image, "Recieved Image", nullptr);

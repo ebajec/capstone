@@ -1,6 +1,7 @@
 #include "covq.h"
 
 #include <cassert>
+#include "timers.h"
 
 #define ZERO_PROB_THRESHOLD 1e-14
 
