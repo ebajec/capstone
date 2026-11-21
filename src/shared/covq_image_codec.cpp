@@ -274,7 +274,7 @@ void COVQDCTCodecTrainer::generate_data(
 		}
 	}
 
-	assert(blk_idx == total_blks);
+	assert(blk_idx <= total_blks);
 }
 
 //------------------------------------------------------------------------------

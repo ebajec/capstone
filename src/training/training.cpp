@@ -199,6 +199,31 @@ Eigen::MatrixXd transition_matrix(const COVQParams &params)
 	//return nec_matrix(params.nb_bits, params.eps, 0.5*params.eps);
 }
 
+struct PCAPlotter
+{
+	struct Distribution {
+		float mu;
+		float var;
+		double min;
+		double max;
+		std::vector<float> data; 
+
+		std::vector<double> xs;
+		std::vector<double> pdf;
+		double pdf_max = 0;
+
+		void set_nbins(uint32_t nbins);
+		void plot(const char *name, int nbins);
+	};
+
+	// distributions along each princial component
+	std::vector<Distribution> dists;
+	int hist_bin_count = 256;
+
+	PCAPlotter(const Eigen::MatrixXd &data);
+	void plot(const char *name);
+};
+
 // Renders the training dataset as a point cloud in RGB space, colored by the
 // partition each point is currently encoded tos.
 struct COVQTrainingVisualization
@@ -270,6 +295,8 @@ struct COVQTrainingVisualization
 	std::unique_ptr<ev2::Viewport> viewport;
 	std::shared_ptr<ev2::MotionCamera> camera;
 
+	std::unique_ptr<PCAPlotter> pca_plotter;
+
 	static constexpr uint64_t INVALID_EPOCH = UINT64_MAX;
 	// training epoch that the GPU data was last synced with
 	uint64_t synced_epoch = INVALID_EPOCH;
@@ -314,7 +341,10 @@ COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::Matrix
 	viz->viewport->set_camera(viz->camera);
 	viz->viewport->set_closable(false);
 
-	viz->num_points = data.cols();
+	const int dims = data.rows();
+	const int num_points = data.cols(); 
+
+	viz->num_points = num_points;
 	size_t points_size = viz->num_points * sizeof(uint32_t);
 
 	viz->rd.points = ev2::create_buffer(gfx, points_size,
@@ -330,9 +360,121 @@ COVQTrainingVisualization *COVQTrainingVisualization::create(const Eigen::Matrix
 
 	gpu_buffer_zero(viz->rd.codewords, points_size);
 
+	viz->pca_plotter = std::make_unique<PCAPlotter>(data);
+
 	TIMER_END(VisualizationCreate);
 
 	return viz;
+}
+
+PCAPlotter::PCAPlotter(const Eigen::MatrixXd &data)
+{
+	const int dims = data.rows(); 
+	const int num_points = data.cols();
+
+	Eigen::VectorXd mu = data.rowwise().mean();
+	Eigen::MatrixXd Xc = data.colwise() - mu;
+	Eigen::MatrixXd K = Xc * Xc.transpose();
+
+	Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(K);
+	Eigen::MatrixXd T = es.eigenvectors().rowwise().reverse();
+
+	for (int i = 0; i < dims; ++i) {
+		dists.emplace_back(Distribution{
+			.mu = (float)mu(i, 0),
+			.var = (float)K(i, i),
+			.data  = std::vector<float>(num_points)
+		});
+	}
+
+	Xc = T.transpose() * Xc;
+
+	Eigen::VectorXd max = Eigen::VectorXd::Constant(dims, DBL_MIN);
+	Eigen::VectorXd min = Eigen::VectorXd::Constant(dims, DBL_MAX);
+
+	for (int i = 0; i < num_points; ++i) {
+		Eigen::Ref<Eigen::VectorXd> col = Xc.col(i);
+		for (int j = 0; j < dims; ++j) {
+	  		float x = col(j);
+			dists[j].data[i] = x; 
+		}
+		min = min.cwiseMin(col);
+		max = max.cwiseMax(col);
+	}
+	for (int j = 0; j < dims; ++j) {
+		dists[j].min = min(j);
+		dists[j].max = max(j);
+	}
+}
+
+void PCAPlotter::Distribution::set_nbins(uint32_t nbins)
+{
+	pdf.clear();
+	pdf.resize(nbins, 0);
+
+	pdf_max = 0;
+
+	double w = (max - min) / nbins;
+
+	xs = std::vector<double>(nbins);
+	for (uint32_t i = 0; i < nbins; ++i) {
+		xs[i] = min + (i + 0.5) * w;
+	}
+
+	const double px = 1.0/(w*(double)data.size());
+
+	for (size_t i = 0; i < data.size(); ++i) {
+		uint32_t k = std::clamp(static_cast<uint32_t>(
+			(float)nbins * (data[i] - min) / (max - min)
+		), 0U, (uint32_t)(pdf.size() - 1));
+		pdf[k] += px;
+
+		pdf_max = std::max(pdf[k], pdf_max);
+	}
+}
+
+void PCAPlotter::plot(const char *name)
+{
+	if (ImGui::SliderInt("Histogram Bins", &hist_bin_count, 1, 256)) {
+		hist_bin_count = std::max(hist_bin_count, 1); 
+	}
+
+	if (ImPlot::BeginPlot(name, ImVec2(200,200))) {
+		double min = DBL_MAX, max = DBL_MIN, pdf_max = DBL_MIN;
+		for (int i = 0; i < dists.size(); ++i) {
+			min = std::min(dists[i].min, min);
+			max = std::max(dists[i].max, max);
+			pdf_max = std::max(dists[i].pdf_max, pdf_max);
+		}
+
+		//ImPlot::SetupAxesLimits(
+		//	min,
+		//	max,
+		//	0.0,
+		//	pdf_max,
+		//	ImPlotCond_Always
+		//);
+
+		for (int i = 0; i < dists.size(); ++i) {
+			char buf[100];
+			snprintf(buf, sizeof(buf), "Axis%i", i);
+			dists[i].plot(buf, hist_bin_count);
+		}
+		ImPlot::EndPlot();
+	}
+}
+void PCAPlotter::Distribution::plot(const char *name, int nbins)
+{
+	if (nbins != pdf.size())
+		set_nbins(nbins);
+
+	ImPlotSpec spec;
+	spec.Offset = (int)0;
+	spec.Flags = ImPlotCond_Always;
+
+	int count = (int)pdf.size();
+
+	ImPlot::PlotBars(name, xs.data(), pdf.data(), count, (max - min)/count);
 }
 
 COVQTrainingVisualization::~COVQTrainingVisualization()
@@ -479,6 +621,8 @@ void COVQTrainingVisualization::draw_gui()
 	static_assert(std::size(color_mode_names) == COLOR_MODE_COUNT);
 
 	ImGui::PushID("COVQTrainingVisualization");
+
+	pca_plotter->plot("Principal Components");
 
 	ImGui::SeparatorText("Points");
 
