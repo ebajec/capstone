@@ -11,6 +11,7 @@ struct IErrorCorrectingCode
     // Useful function for counting num of encoded/decoded bits given an input size
     virtual constexpr size_t num_encoded_bits(size_t count) const = 0;
     virtual constexpr size_t num_decoded_bits(size_t count) const = 0;
+    virtual constexpr const char* name() const = 0;
 
     constexpr size_t num_encoded_bytes(size_t count) const
     {
@@ -42,6 +43,7 @@ struct RepetitionCode final : public IErrorCorrectingCode
     // For repetition codes, the number of encoded and decoded bits its scaled by num_repetitions
     constexpr size_t num_encoded_bits(size_t count) const override { return count * repetitions; }
     constexpr size_t num_decoded_bits(size_t count) const override { return count / repetitions; }
+    constexpr const char* name() const override { return "Repetition"; }
 
     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
@@ -60,6 +62,7 @@ struct HammingCode final : public IErrorCorrectingCode
 
     constexpr size_t num_encoded_bits(size_t count) const override;
     constexpr size_t num_decoded_bits(size_t count) const override;
+    constexpr const char* name() const override { return "Hamming"; }
 
     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
@@ -68,6 +71,28 @@ private:
     static constexpr uint32_t encodeBlock(uint32_t data);
     static constexpr uint32_t decodeBlock(uint32_t encoded);
 };
+// ---------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------
+// BCH code: 
+// struct BCHCode final : public IErrorCorrectingCode
+// {
+//     static constexpr size_t q = 2;
+//     static constexpr size_t 
+//     static constexpr size_t DataBits = 8;
+//     static constexpr size_t EncodedBits = 12;
+//
+//     constexpr size_t num_encoded_bits(size_t count) const override;
+//     constexpr size_t num_decoded_bits(size_t count) const override;
+//     constexpr const char* name() const override { return "BCH"; }
+//
+//     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
+//     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
+//
+// private:
+//     static constexpr uint32_t encodeBlock(uint32_t data);
+//     static constexpr uint32_t decodeBlock(uint32_t encoded);
+// };
 // ---------------------------------------------------------------------------------
 
 void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
@@ -166,19 +191,14 @@ constexpr uint32_t HammingCode::encodeBlock(uint32_t data)
 {
     uint32_t out = 0;
 
-    size_t output_offset = 0;
-    for(size_t d_idx = 0; d_idx < DataBits; )
+    size_t d_idx = 0;
+    for(size_t output_offset = 0; output_offset < EncodedBits; output_offset++)
     {
-        auto output_location = output_offset + 1;
-        if((output_location & (output_location - 1)) == 0) // Is power of two; skip parity bit
-        {
-            output_offset++;
-        }
-        else // Write bit as normal
+        const size_t output_location = output_offset + 1;
+        if((output_location & (output_location - 1)) != 0) // Is power of two; skip parity bit
         {
             const uint32_t bit = (data >> d_idx) & 1;
             out |= bit << output_offset;
-            output_offset++;
             d_idx++;
         }
     }
@@ -187,7 +207,7 @@ constexpr uint32_t HammingCode::encodeBlock(uint32_t data)
     {
         uint32_t parity_bit = 0;
 
-        for(size_t data_pos = 1; data_pos <= EncodedBits; ++data_pos)
+        for(size_t data_pos = parity_pos; data_pos <= EncodedBits; ++data_pos)
         {
             if(parity_pos & data_pos) // Find all bits this parity bit accounts for
             {
@@ -214,7 +234,7 @@ constexpr uint32_t HammingCode::decodeBlock(uint32_t encoded)
     {
         uint32_t parity_bit = 0;
 
-        for(size_t data_pos = 1; data_pos <= EncodedBits; ++data_pos)
+        for(size_t data_pos = parity_pos; data_pos <= EncodedBits; ++data_pos)
         {
             if(data_pos & parity_pos)
             {
@@ -268,17 +288,14 @@ int main(int argc, char** argv)
         }
     }
 
-    constexpr HammingCode codec;
+    static constexpr HammingCode hamming;
+    static constexpr RepetitionCode repetition;
+    constexpr std::array<const IErrorCorrectingCode*, 2> eccs = {&hamming, &repetition};
 
     constexpr size_t input_byte_count = 1024 * 1024; // 1 MB example
     constexpr size_t input_bit_count = input_byte_count * 8;
-    constexpr size_t encoded_bit_count = codec.num_encoded_bits(input_bit_count);
-    constexpr size_t encoded_byte_count = codec.num_encoded_bytes(input_bit_count);
-    constexpr size_t decoded_byte_count = codec.num_decoded_bytes(encoded_bit_count);
 
     auto bytes = std::make_unique<uint8_t[]>(input_byte_count);
-    auto encoded = std::make_unique<uint8_t[]>(encoded_byte_count);
-    auto decoded = std::make_unique<uint8_t[]>(decoded_byte_count);
 
     std::mt19937 random(0);
     for (size_t i = 0; i < input_byte_count; ++i)
@@ -286,24 +303,39 @@ int main(int argc, char** argv)
 
     printf("Input: %zu bytes (%zu bits)\n", input_byte_count, input_bit_count);
 
-    TIMER_BEGIN(Encode)
-    codec.encode(encoded.get(), input_bit_count, bytes.get());
-    TIMER_END(Encode)
-
-    printf("Encoded: %zu bytes (%zu bits)\n", encoded_byte_count, encoded_bit_count);
-
-    for(size_t i = 2; i < encoded_bit_count; i += HammingCode::EncodedBits)
+    bool all_match = true;
+    for(const IErrorCorrectingCode* codec : eccs)
     {
-        encoded[i / 8] ^= uint8_t(1u << (i % 8));
+        const size_t encoded_bit_count = codec->num_encoded_bits(input_bit_count);
+        const size_t encoded_byte_count = codec->num_encoded_bytes(input_bit_count);
+        const size_t decoded_byte_count = codec->num_decoded_bytes(encoded_bit_count);
+        const size_t encoded_bits_per_input_byte = codec->num_encoded_bits(8);
+
+        auto encoded = std::make_unique<uint8_t[]>(encoded_byte_count);
+        auto decoded = std::make_unique<uint8_t[]>(decoded_byte_count);
+
+        printf("\n%s\n", codec->name());
+        TIMER_BEGIN(Encode)
+        codec->encode(encoded.get(), input_bit_count, bytes.get());
+        TIMER_END(Encode)
+
+        printf("Encoded: %zu bytes (%zu bits)\n", encoded_byte_count, encoded_bit_count);
+
+        for(size_t i = 2; i < encoded_bit_count; i += encoded_bits_per_input_byte)
+        {
+            encoded[i / 8] ^= uint8_t(1u << (i % 8));
+        }
+
+        TIMER_BEGIN(Decode)
+        codec->decode(decoded.get(), encoded_bit_count, encoded.get());
+        TIMER_END(Decode)
+
+        const bool matches = decoded_byte_count == input_byte_count &&
+            std::memcmp(decoded.get(), bytes.get(), input_byte_count) == 0;
+        printf("Decoded matches input: %s\n", matches ? "yes" : "no");
+        all_match &= matches;
     }
 
-    TIMER_BEGIN(Decode)
-    codec.decode(decoded.get(), encoded_bit_count, encoded.get());
-    TIMER_END(Decode)
-
-    const bool matches = std::memcmp(decoded.get(), bytes.get(), input_byte_count) == 0;
-    printf("Decoded matches input: %s\n", matches ? "yes" : "no");
-
-    return matches ? 0 : 1;
+    return all_match ? 0 : 1;
 }
 
