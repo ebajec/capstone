@@ -3,6 +3,7 @@
 #include "timers.h"
 
 #include <cassert>
+#include <format>
 
 // @brief map an input vector to an index to send over the channel
 static constexpr uint32_t covq_encode(const COVQCodec *codec, const double *in)
@@ -166,9 +167,9 @@ void COVQDCTCodec::decode(uint32_t w, uint32_t h, uint32_t ch,
 // Codec training
 
 COVQDCTCodecTrainer *COVQDCTCodecTrainer::create(
-		const Eigen::MatrixXd X[64],
-		const uint8_t bit_table[64],
-		const std::function<Eigen::MatrixXd(int k/*bits*/)> matrix_generator
+	const Eigen::MatrixXd X[64],
+	const uint8_t bit_table[64],
+	const std::function<Eigen::MatrixXd(int k/*bits*/)> matrix_generator
 )
 {
 	COVQDCTCodecTrainer *trainer = new COVQDCTCodecTrainer{};
@@ -204,20 +205,25 @@ void COVQDCTCodecTrainer::train(const Eigen::MatrixXd X[64])
 	++epoch;
 }
 
-std::unique_ptr<COVQDCTCodec> COVQDCTCodecTrainer::create_codec()
+std::unique_ptr<COVQDCTCodec> COVQDCTCodecTrainer::create_codec(const char *name)
 {
+	uint32_t bits_per_blk = 0;
+
 	COVQDCTCodec *codec = new COVQDCTCodec{};
 	for (int i = 0; i < 64; ++i) {
 		if (ctx[i]) {
 			codec->quantizers[i].reset(ctx[i]->create_codec());
 			codec->dim = ctx[i]->dim;
+			bits_per_blk += ctx[i]->word_length;
 		}
 	}
+
+	codec->name = std::format("{}_bpp{:.2f}_epoch{}", name, (float)bits_per_blk/64.f, epoch); 
 
 	return std::unique_ptr<COVQDCTCodec>(codec);
 }
 
-void COVQDCTCodecTrainer::generate_data(
+int COVQDCTCodecTrainer::generate_data(
 	int dim,
 	uint32_t count,
 	const Image *images,
@@ -250,6 +256,11 @@ void COVQDCTCodecTrainer::generate_data(
 	  	const int w = image.w;
 	  	const int h = image.h;
 
+		if (ch < dim) {
+			fprintf(stderr, "Cannot generate data of dimension %d from image with %d channels", dim, ch);
+			return -1;
+		}
+
 		for (uint32_t by = 0; by + 8< image.h; by += 8) {
 			for (uint32_t bx = 0; bx + 8 < image.w; bx += 8) {
 				for (int c = 0; c < dim; ++c) {
@@ -275,6 +286,7 @@ void COVQDCTCodecTrainer::generate_data(
 	}
 
 	assert(blk_idx <= total_blks);
+	return 0;
 }
 
 //------------------------------------------------------------------------------

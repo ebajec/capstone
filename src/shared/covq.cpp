@@ -174,6 +174,8 @@ void COVQTrainingContext::train(const Eigen::MatrixXd& X, bool log)
 	TIMER_BEGIN(TrainingIteration);
 #endif
 
+	Eigen::MatrixXd Y_old = Y;
+
 	Y.setZero();
 	Y.noalias() = centroids * P;
 
@@ -184,7 +186,7 @@ void COVQTrainingContext::train(const Eigen::MatrixXd& X, bool log)
 
 		// TODO: Ignore when probability is near zero
 		if (fabs(prob_j) < ZERO_PROB_THRESHOLD) {
-			Y.col(j).setZero();
+			Y.col(j) = Y_old.col(j);
 		} else {
 			Y.col(j) /= prob_j;
 			++num_nonzero_prob;

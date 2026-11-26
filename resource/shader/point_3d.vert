@@ -6,17 +6,29 @@
 
 layout (location = 0) flat out vec3 out_color;
 
-vec3 get_value(uint idx)
+// i-th unorm16 component of a tightly packed buffer
+float load_unorm16(U32Buffer buf, uint i)
 {
-	return unpackUnorm4x8(pc.points.data[idx]).rgb;
+	return unpackUnorm2x16(buf.data[i >> 1])[i & 0x1u];
 }
 
-// falls back to `value` if there is no codepoint for this codeword yet
+// idx-th vector of `buf` mapped to display space
+vec3 get_vector(U32Buffer buf, uint idx)
+{
+	uint base = idx * pc.dim;
+
+	vec3 v = vec3(0);
+	for (uint i = 0; i < min(pc.dim, 3u); ++i)
+		v += pc.basis[i] * load_unorm16(buf, base + i);
+
+	return v;
+}
+
 vec3 get_codepoint(uint codeword, vec3 value)
 {
 	if (codeword >= pc.num_codepoints)
 		return value;
-	return unpackUnorm4x8(pc.codepoints.data[codeword]).rgb;
+	return get_vector(pc.codepoints, codeword);
 }
 
 void main()
@@ -30,7 +42,7 @@ void main()
 
 	uint idx = min(uint(gl_InstanceIndex) * max(pc.stride, 1u), pc.count - 1);
 
-	vec3 value = get_value(idx);
+	vec3 value = get_vector(pc.points, idx);
 	uint codeword = pc.codewords.data[idx];
 
 	vec3 codepoint = get_codepoint(codeword, value);

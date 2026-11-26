@@ -35,6 +35,7 @@ struct Image
 // @breif vector quantization on each DCT bin when multiple channels are present
 struct COVQDCTCodec : IBlockImageCodec
 {
+	std::string name;
 	std::unique_ptr<COVQCodec> quantizers[64];
 	int dim;
 
@@ -42,9 +43,10 @@ struct COVQDCTCodec : IBlockImageCodec
 	virtual size_t get_compressed_size(uint32_t w, uint32_t h, uint32_t ch) const override;
 
 	virtual void encode(uint32_t w, uint32_t h, uint32_t ch,
-					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
+					 const uint8_t *in_bytes, uint8_t *out_bytes) const final;
 	virtual void decode(uint32_t w, uint32_t h, uint32_t ch,
-					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
+					 const uint8_t *in_bytes, uint8_t *out_bytes) const final;
+	virtual const char* get_name() const final {return name.c_str();}
 };
 
 struct COVQDCTCodecTrainer
@@ -68,9 +70,9 @@ struct COVQDCTCodecTrainer
 	);
 
 	void train(const Eigen::MatrixXd X[64]);
-	std::unique_ptr<COVQDCTCodec> create_codec();
+	std::unique_ptr<COVQDCTCodec> create_codec(const char *name);
 
-	static void generate_data(
+	static int generate_data(
 		int dim,
 		uint32_t count,
 		const Image *images,

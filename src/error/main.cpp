@@ -2,6 +2,7 @@
 #include "timers.h"
 
 #include <random>
+#include <cstring>
 
 // ---------------------------------------------------------------------------------
 // ECC interface

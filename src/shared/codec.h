@@ -16,6 +16,8 @@ struct IBlockImageCodec
 					 const uint8_t *in_bytes, uint8_t *out_bytes) const = 0;
 	virtual void decode(uint32_t w, uint32_t h, uint32_t ch,
 					 const uint8_t *in_bytes, uint8_t *out_bytes) const = 0;
+
+	virtual const char *get_name() const {return "[unnamed]";}
 };
 
 struct IDCTBlockCodec
@@ -37,6 +39,8 @@ struct IDCTBlockCodec
 		size_t start_bit,
 		float *out_values
 	) const = 0;
+
+	virtual const char* get_name() const {return "[unnamed]";}
 };
 
 // Bits per coefficient, row-major starting from 0 at the top left
@@ -177,11 +181,14 @@ struct DCTImageCodec : public IBlockImageCodec
 					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
 	virtual void decode(uint32_t w, uint32_t h, uint32_t ch,
 					 const uint8_t *in_bytes, uint8_t *out_bytes) const override;
+	virtual const char * get_name() const final {return quantizer->get_name();}
 };
 
 struct UniformDCTQuantizer : public IDCTBlockCodec
 {
 	static constexpr uint32_t max_bits = 16;
+
+	std::string name;
 
 	// Indexed by row-major coefficient index (see BitTables). Coefficients
 	// are still written to the stream in zigzag order.
@@ -210,19 +217,21 @@ struct UniformDCTQuantizer : public IDCTBlockCodec
 	UniformDCTQuantizer(const uint8_t *in_bit_table,
 					 const float *in_ranges = nullptr);
 
-	size_t encode_blk(
+	virtual size_t encode_blk(
 		const float *in_values,
 		uint8_t *out_bytes,
 		size_t start_bit
-	) const;
+	) const final;
 
-	size_t decode_blk(
+	virtual size_t decode_blk(
 		const uint8_t *in_bytes,
 		size_t start_bit,
 		float *out_values
-	) const;
+	) const final;
 
-	uint32_t bits_per_blk() const;
+	virtual uint32_t bits_per_blk() const final;
+
+	virtual const char* get_name() const final {return name.c_str();}
 };
 
 #endif

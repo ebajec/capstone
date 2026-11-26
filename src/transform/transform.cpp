@@ -110,11 +110,11 @@ struct App
 		orig_img = std::move(img);
 
 		if (rd.orig.is_valid()) {
-			ev2::editor::close_image_viewer(orig_viewer);
+			orig_viewer.reset();
 			ev2::destroy_image(ctx, rd.orig);
 		}
 		if (rd.decomp.is_valid()) {
-			ev2::editor::close_image_viewer(decomp_viewer);
+			decomp_viewer.reset();
 			ev2::destroy_image(ctx, rd.decomp);
 		}
 

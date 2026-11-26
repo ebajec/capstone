@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <format>
 
 // @return compressed size (in bytes) of an image with the specified dimensions
 size_t DCTImageCodec::get_compressed_size(uint32_t w, uint32_t h, uint32_t ch) const
@@ -90,6 +91,8 @@ UniformDCTQuantizer::UniformDCTQuantizer(const uint8_t *in_bit_table,
 			scales[i] = 0;
 		}
 	}
+
+	name = std::format("UniformDCT_bpp{}(1ch)", (float)bits_per_blk() / 64.f);
 }
 
 uint32_t UniformDCTQuantizer::bits_per_blk() const
