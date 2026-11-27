@@ -38,7 +38,8 @@ struct IErrorCorrectingCode
 // Decoded:   1   0   1
 struct RepetitionCode final : public IErrorCorrectingCode
 {
-    static constexpr uint32_t repetitions = 3;
+    static constexpr uint8_t repetitions = 3;
+    static constexpr uint8_t rep_mask = (1u << repetitions) - 1u;
 
     // For repetition codes, the number of encoded and decoded bits its scaled by num_repetitions
     constexpr size_t num_encoded_bits(size_t count) const override { return count * repetitions; }
@@ -79,8 +80,6 @@ private:
 // {
 //     static constexpr size_t q = 2;
 //     static constexpr size_t 
-//     static constexpr size_t DataBits = 8;
-//     static constexpr size_t EncodedBits = 12;
 //
 //     constexpr size_t num_encoded_bits(size_t count) const override;
 //     constexpr size_t num_decoded_bits(size_t count) const override;
@@ -88,23 +87,27 @@ private:
 //
 //     void encode(uint8_t* out, size_t count, const uint8_t* in) const override;
 //     void decode(uint8_t* out, size_t count, const uint8_t* in) const override;
-//
-// private:
-//     static constexpr uint32_t encodeBlock(uint32_t data);
-//     static constexpr uint32_t decodeBlock(uint32_t encoded);
 // };
 // ---------------------------------------------------------------------------------
 
 void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 {
-    size_t output_offset = 0;
-    for (size_t i = 0; i < count; ++i)
+    size_t output_byte = 0;
+    for (size_t i = 0; count - i >= 8; i += 8) // Iterate one byte at a time
     {
-        uint32_t bit = 0;
-        read_bits(bit, 1, in, i); // Read one bit at a time
+        const uint8_t input = in[i / 8];
+        uint32_t packed = 0;
 
-        for (uint32_t j = 0; j < repetitions; ++j)
-            output_offset = write_bits(bit, 1, out, output_offset);
+        for (uint8_t j = 0; j < 8; ++j)
+        {
+            const uint8_t bit = (input >> j) & 1;
+            const uint8_t repeated_pattern = (0 - bit) & rep_mask;
+            packed |= uint32_t(repeated_pattern) << (repetitions * j);
+        }
+
+        for (uint8_t j = 0; j < repetitions; ++j) // unpack one byte at a time
+            out[output_byte + j] = uint8_t(packed >> (8 * j));
+        output_byte += repetitions;
     }
 }
 
