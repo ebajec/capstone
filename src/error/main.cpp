@@ -93,7 +93,7 @@ private:
 void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 {
     size_t output_byte = 0;
-    for (size_t i = 0; count - i >= 8; i += 8) // Iterate one byte at a time
+    for (size_t i = 0; i < count; i += 8) // Iterate one byte at a time
     {
         const uint8_t input = in[i / 8];
         uint32_t packed = 0;
@@ -113,21 +113,23 @@ void RepetitionCode::encode(uint8_t* out, size_t count, const uint8_t* in) const
 
 void RepetitionCode::decode(uint8_t* out, size_t count, const uint8_t* in) const
 {
-    const size_t out_count = num_decoded_bits(count);
-    size_t input_offset = 0;
-    for (size_t i = 0; i < out_count; ++i)
+    const size_t out_bytes = num_decoded_bytes(count);
+
+    for (size_t i = 0; i < out_bytes; ++i) // Iterate one byte at a time
     {
-        uint32_t ones = 0;
-        for (uint32_t j = 0; j < repetitions; ++j)
+        uint32_t packed = 0;
+        for (size_t j = 0; j < repetitions; ++j) // Gather all repetitions * bytes worth of encoded bites
+            packed |= uint32_t(in[i * repetitions + j]) << (8 * j);
+
+        uint8_t decoded = 0;
+        for (uint8_t j = 0; j < 8; ++j) // For each decoded bit, retreieve the repeated pattern
         {
-            uint32_t bit;
-            input_offset = read_bits(bit, 1, in, input_offset);
-            ones += bit; // count number of ones
+            const uint8_t repeated_pattern = (packed >> (j * repetitions)) & rep_mask;
+            const bool bit = std::popcount(repeated_pattern) > repetitions / 2;
+            decoded |= uint8_t(bit) << j;
         }
 
-        // If we have more ones than the number of repetitions over 2, then we decode a 1, otherwise 0
-        const uint32_t bit = ones > repetitions / 2 ? 1 : 0;
-        write_bits(bit, 1, out, i);
+        out[i] = decoded; // write byte
     }
 }
 
