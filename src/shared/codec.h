@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 // Fixed length image compression interface
 struct IBlockImageCodec
