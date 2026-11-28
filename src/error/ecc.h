@@ -5,7 +5,6 @@
 
 #include <bit>
 #include <numeric>
-#include <type_traits>
 
 namespace ecc::detail
 {
